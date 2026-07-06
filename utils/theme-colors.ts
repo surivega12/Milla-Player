@@ -1,0 +1,161 @@
+export interface ThemePalette {
+  background: string;
+  foreground: string;
+  card: string;
+  cardForeground: string;
+  primary: string;
+  primaryForeground: string;
+  secondary: string;
+  secondaryForeground: string;
+  muted: string;
+  mutedForeground: string;
+  border: string;
+  input: string;
+}
+
+export const THEMES: Record<string, ThemePalette> = {
+  'theme-monochrome': {
+    background: '#0a0a0a',
+    foreground: '#f5f5f5',
+    card: '#141414',
+    cardForeground: '#f5f5f5',
+    primary: '#f5f5f5',
+    primaryForeground: '#0a0a0a',
+    secondary: '#1f1f1f',
+    secondaryForeground: '#e0e0e0',
+    muted: '#1f1f1f',
+    mutedForeground: '#a0a0a0',
+    border: '#2a2a2a',
+    input: '#1f1f1f',
+  },
+  'theme-dark': {
+    background: '#0a0a0a',
+    foreground: '#ededed',
+    card: '#1a1a1a',
+    cardForeground: '#ededed',
+    primary: '#3b82f6',
+    primaryForeground: '#ffffff',
+    secondary: '#2a2a2a',
+    secondaryForeground: '#ededed',
+    muted: '#2a2a2a',
+    mutedForeground: '#a0a0a0',
+    border: '#2a2a2a',
+    input: '#2a2a2a',
+  },
+  'theme-ocean': {
+    background: '#0c1821',
+    foreground: '#e0f4ff',
+    card: '#1b2838',
+    cardForeground: '#e0f4ff',
+    primary: '#06b6d4',
+    primaryForeground: '#0c1821',
+    secondary: '#1e3a52',
+    secondaryForeground: '#e0f4ff',
+    muted: '#1e3a52',
+    mutedForeground: '#94c5e0',
+    border: '#1e3a52',
+    input: '#1e3a52',
+  },
+  'theme-purple': {
+    background: '#0f0514',
+    foreground: '#f3e8ff',
+    card: '#1e0a2e',
+    cardForeground: '#f3e8ff',
+    primary: '#a855f7',
+    primaryForeground: '#ffffff',
+    secondary: '#2d1545',
+    secondaryForeground: '#f3e8ff',
+    muted: '#2d1545',
+    mutedForeground: '#c4b5fd',
+    border: '#2d1545',
+    input: '#2d1545',
+  },
+  'theme-forest': {
+    background: '#0a1409',
+    foreground: '#e8f5e9',
+    card: '#1a2e1a',
+    cardForeground: '#e8f5e9',
+    primary: '#22c55e',
+    primaryForeground: '#0a1409',
+    secondary: '#2d4a2d',
+    secondaryForeground: '#e8f5e9',
+    muted: '#2d4a2d',
+    mutedForeground: '#86efac',
+    border: '#2d4a2d',
+    input: '#2d4a2d',
+  },
+  'theme-mocha': {
+    background: '#1e1e2e',
+    foreground: '#cdd6f4',
+    card: '#313244',
+    cardForeground: '#9399b2',
+    primary: '#89b4fa',
+    primaryForeground: '#313244',
+    secondary: '#45475a',
+    secondaryForeground: '#9399b2',
+    muted: '#313244',
+    mutedForeground: '#a6adc8',
+    border: '#313244',
+    input: '#45475a',
+  },
+  'theme-macchiato': {
+    background: '#24273a',
+    foreground: '#cad3f5',
+    card: '#363a4f',
+    cardForeground: '#939ab7',
+    primary: '#8aadf4',
+    primaryForeground: '#363a4f',
+    secondary: '#494d64',
+    secondaryForeground: '#6e738d',
+    muted: '#363a4f',
+    mutedForeground: '#a5adcb',
+    border: '#363a4f',
+    input: '#494d64',
+  },
+  'theme-frappe': {
+    background: '#303446',
+    foreground: '#c6d0f5',
+    card: '#414559',
+    cardForeground: '#949cbb',
+    primary: '#8caaee',
+    primaryForeground: '#313244',
+    secondary: '#51576d',
+    secondaryForeground: '#a5adce',
+    muted: '#414559',
+    mutedForeground: '#a5adce',
+    border: '#414559',
+    input: '#45475a',
+  },
+  'theme-latte': {
+    background: '#eff1f5',
+    foreground: '#4c4f69',
+    card: '#ccd0da',
+    cardForeground: '#7c7f93',
+    primary: '#1e66f5',
+    primaryForeground: '#ccd0da',
+    secondary: '#bcc0cc',
+    secondaryForeground: '#9ca0b0',
+    muted: '#ccd0da',
+    mutedForeground: '#6c6f85',
+    border: '#ccd0da',
+    input: '#bcc0cc',
+  },
+  'theme-white': {
+    background: '#f5f5f5',
+    foreground: '#1a1a1a',
+    card: '#e8e8e8',
+    cardForeground: '#1a1a1a',
+    primary: '#1a1a1a',
+    primaryForeground: '#f5f5f5',
+    secondary: '#dddddd',
+    secondaryForeground: '#2a2a2a',
+    muted: '#e0e0e0',
+    mutedForeground: '#555555',
+    border: '#cccccc',
+    input: '#e0e0e0',
+  },
+};
+
+export function getThemeColors(themeClass: string): ThemePalette {
+  return THEMES[themeClass] || THEMES['theme-monochrome'];
+}
