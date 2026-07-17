@@ -1,0 +1,19 @@
+# Core Django & API Framework
+Django>=5.0,<6.0
+djangorestframework>=3.14.0
+django-cors-headers>=4.3.0
+psycopg2-binary>=2.9.9
+
+# HTTP Utilities & Parsing
+requests>=2.31.0
+urllib3>=2.0.0
+
+# DSP Audio Processing & Harmonic Analysis (Punto 2.3)
+numpy>=1.26.0
+scipy>=1.11.0
+librosa>=0.10.1
+soundfile>=0.12.1
+
+# Spleeter for Vocal Separation & Silence Detection
+# Nota: Si spleeter requiere TensorFlow en ciertas plataformas, librosa y scipy proveen fallback de detección de silencio espectral.
+spleeter>=2.4.0

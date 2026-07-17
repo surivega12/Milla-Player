@@ -39,3 +39,8 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# local caches and db
+.npm-cache/
+*.db
+*.db-journal

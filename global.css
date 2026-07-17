@@ -2,6 +2,15 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ===== WEB: Full Black Body — Elimina franjas blancas en el navegador ===== */
+html, body, #root {
+  background-color: #000000 !important;
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
 /* Base Variable Defaults */
 :root {
   --background: #0a0a0a;

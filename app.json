@@ -17,15 +17,39 @@
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
       "predictiveBackGestureEnabled": false,
-      "package": "com.millay.Milla"
+      "package": "com.millay.Milla",
+      "permissions": [
+        "READ_MEDIA_AUDIO",
+        "READ_EXTERNAL_STORAGE",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+        "WAKE_LOCK",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_AUDIO"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
     },
+    "plugins": [
+      "expo-sqlite",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Permite a Milla acceder a tu biblioteca de música y carátulas para el procesamiento Hi-Res y AutoMix offline.",
+          "savePhotosPermission": "Permite a Milla guardar carátulas procesadas y optimizadas en tu almacenamiento local."
+        }
+      ]
+    ],
     "extra": {
       "eas": {
         "projectId": "6bc3a1f7-b289-46d4-a53e-398bd2e33d1a"
       }
-    }
+    },
+    "owner": "millay"
   }
 }

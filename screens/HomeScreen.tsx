@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   View,
   Text,
@@ -7,83 +7,45 @@ import {
   Image,
   Dimensions,
   ActivityIndicator,
+  StyleSheet,
+  Modal,
+  Alert,
+  Platform,
 } from 'react-native';
-import { Menu, Sparkles, Play, Disc, Palette, FolderOpen, Download, ArrowDownToLine, AlertTriangle, Hammer } from 'lucide-react-native';
+import Animated, { useSharedValue, useAnimatedScrollHandler } from 'react-native-reanimated';
+import { AnimatedHeader } from '../components/AnimatedHeader';
+import {
+  Search,
+  Settings,
+  Cast,
+  Clock,
+  FolderPlus,
+  TrendingUp,
+  Shuffle,
+  RefreshCw,
+  ArrowRight,
+  ArrowLeft,
+  Play,
+  MoreVertical,
+  Disc,
+  User,
+  FolderOpen,
+  Sparkles,
+  Zap,
+  Heart,
+  Radio,
+  Smile,
+  Coffee,
+} from 'lucide-react-native';
 import { Track } from '../components/PlayerBar';
-import { getThemeColors } from '../utils/theme-colors';
+import { NotificationCard } from '../components/NotificationCard';
+import { useVertexQueue } from '../services/queue-service';
+import { playPlaylist } from '../services/audio-service';
+import { getTracksByGenre, getForgottenTracks, getTracksByEmotion } from '../services/database-service';
 
 const { width } = Dimensions.get('window');
-const CARD_WIDTH = (width - 48) / 2;
 
-export const SAMPLE_CATALOG: Track[] = [
-  {
-    id: 'track-1',
-    title: 'Monochrome Symphony',
-    artist: 'Milla Orchestra',
-    album: 'Cybernetic Hi-Fi',
-    duration: 245,
-    qualityBadge: 'FLAC 24-bit/192kHz',
-    artwork: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=600&q=80',
-  },
-  {
-    id: 'track-2',
-    title: 'Deep Forest FLAC',
-    artist: 'Nordic Audio Collective',
-    album: 'Scandinavian Echoes',
-    duration: 312,
-    qualityBadge: 'FLAC 24-bit/96kHz',
-    artwork: 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=600&q=80',
-  },
-  {
-    id: 'track-3',
-    title: 'Purple Horizon 192kHz',
-    artist: 'Synthwave Dreams',
-    album: 'Neon Grid 1984',
-    duration: 198,
-    qualityBadge: 'FLAC 24-bit/192kHz',
-    artwork: 'https://images.unsplash.com/photo-1508739773434-c26b3d09e071?w=600&q=80',
-  },
-  {
-    id: 'track-4',
-    title: 'Acoustic Gold Standard',
-    artist: 'Elena Rostova',
-    album: 'Live at Vienna Hall',
-    duration: 276,
-    qualityBadge: 'DSD 5.6MHz Direct',
-    artwork: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=600&q=80',
-  },
-  {
-    id: 'track-5',
-    title: 'Midnight Abyssal Sound',
-    artist: 'Sub-Oceanic',
-    album: 'Mariana Trench',
-    duration: 354,
-    qualityBadge: 'FLAC 16-bit/44.1kHz',
-    artwork: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600&q=80',
-  },
-  {
-    id: 'track-6',
-    title: 'Analog Warmth Vinyl',
-    artist: 'The Vacuum Tubes',
-    album: 'Pure Voltage',
-    duration: 215,
-    qualityBadge: 'FLAC 24-bit/192kHz',
-    artwork: 'https://images.unsplash.com/photo-1461784121038-f088ca1e7714?w=600&q=80',
-  },
-];
-
-const THEME_LIST = [
-  { id: 'theme-monochrome', name: 'Monochrome', color: '#0a0a0a', border: '#f5f5f5' },
-  { id: 'theme-dark', name: 'Dark Blue', color: '#1a1a1a', border: '#3b82f6' },
-  { id: 'theme-ocean', name: 'Ocean', color: '#0c1821', border: '#06b6d4' },
-  { id: 'theme-purple', name: 'Purple', color: '#0f0514', border: '#a855f7' },
-  { id: 'theme-forest', name: 'Forest', color: '#0a1409', border: '#22c55e' },
-  { id: 'theme-mocha', name: 'Mocha', color: '#1e1e2e', border: '#89b4fa' },
-  { id: 'theme-macchiato', name: 'Macchiato', color: '#24273a', border: '#8aadf4' },
-  { id: 'theme-frappe', name: 'Frappé', color: '#303446', border: '#8caaee' },
-  { id: 'theme-latte', name: 'Latte', color: '#eff1f5', border: '#1e66f5' },
-  { id: 'theme-white', name: 'White', color: '#f5f5f5', border: '#1a1a1a' },
-];
+export const SAMPLE_CATALOG: Track[] = [];
 
 interface HomeScreenProps {
   onOpenSidebar: () => void;
@@ -94,10 +56,15 @@ interface HomeScreenProps {
   tracks: Track[];
   onScanLocal: () => void;
   isScanning: boolean;
+  scanProgressText?: string;
   downloadedIds: Set<string>;
   downloadProgress: Record<string, number>;
   onDownloadTrack: (track: Track) => void;
+  onOptimize?: () => void;
+  isOptimizing?: boolean;
 }
+
+type SubScreenType = 'home' | 'history' | 'recent' | 'top_played';
 
 export const HomeScreen: React.FC<HomeScreenProps> = ({
   onOpenSidebar,
@@ -108,82 +75,722 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   tracks,
   onScanLocal,
   isScanning,
+  scanProgressText,
   downloadedIds,
   downloadProgress,
   onDownloadTrack,
+  onOptimize,
+  isOptimizing = false,
 }) => {
-  const colors = getThemeColors(currentTheme);
+  const [activeSubScreen, setActiveSubScreen] = useState<SubScreenType>('home');
+  const [isEmotionModalOpen, setIsEmotionModalOpen] = useState<boolean>(false);
+  const { setCatalog, setSessionAutoMixForced } = useVertexQueue();
 
-  // Detectar pistas corruptas
-  const tracksNeedingRepair = tracks.filter(t => (t as any).needs_repair).length;
+  const startSessionPlaylist = async (playlistTracks: Track[], titleAlert: string) => {
+    if (!playlistTracks || playlistTracks.length === 0) {
+      Alert.alert('Milla DJ', 'No se encontraron suficientes pistas compatibles en la biblioteca local.');
+      return;
+    }
+    if (typeof setSessionAutoMixForced === 'function') {
+      setSessionAutoMixForced(true);
+    }
+    if (typeof setCatalog === 'function') {
+      setCatalog(playlistTracks as any);
+    }
+    await playPlaylist(playlistTracks, 0);
+    Alert.alert(
+      titleAlert,
+      `🎵 Sesión iniciada con ${playlistTracks.length} canciones.\n⚡ Modo Auto Mix con Crossfade FORZADO y activo para esta sesión táctica.`
+    );
+  };
 
-  return (
-    <View className="flex-1">
-      {/* Cabecera Superior (Top Nav) */}
-      <View className="flex-row items-center justify-between px-5 pt-14 pb-4">
-        <TouchableOpacity
-          onPress={onOpenSidebar}
-          hitSlop={{ top: 15, bottom: 15, left: 15, right: 15 }}
-          className="w-10 h-10 rounded-xl bg-[var(--card)]/80 border border-[var(--border)]/60 items-center justify-center shadow-md"
+  const scrollY = useSharedValue(0);
+  const headerTranslationY = useSharedValue(0);
+
+  const scrollHandler = useAnimatedScrollHandler({
+    onScroll: (event, ctx: any) => {
+      const currentY = event.contentOffset.y;
+      const prevY = ctx.prevY ?? 0;
+      const deltaY = currentY - prevY;
+      
+      let newTranslation = headerTranslationY.value - deltaY;
+      if (newTranslation > 0) newTranslation = 0;
+      if (newTranslation < -120) newTranslation = -120;
+      
+      if (currentY <= 0) newTranslation = 0;
+      
+      headerTranslationY.value = newTranslation;
+      ctx.prevY = currentY;
+      scrollY.value = currentY;
+    },
+    onBeginDrag: (event, ctx: any) => {
+      ctx.prevY = event.contentOffset.y;
+    }
+  });
+
+  const tracksNeedingRepair = tracks.filter((t) => (t as any).needs_repair).length;
+
+  // Helpers de datos para las sub-pantallas
+  const getSubScreenTitle = () => {
+    if (activeSubScreen === 'history') return 'Historial';
+    if (activeSubScreen === 'recent') return 'Añadidos recientemente';
+    return 'Más reproducidas';
+  };
+
+  const getSubScreenTracks = () => {
+    if (activeSubScreen === 'recent') return [...tracks].reverse();
+    if (activeSubScreen === 'top_played') {
+      return [...tracks].sort((a, b) => ((b as any).play_count || 0) - ((a as any).play_count || 0));
+    }
+    return tracks;
+  };
+
+  const getTrackQualityLabel = (track: Track): string => {
+    if (track.qualityBadge) return track.qualityBadge;
+    if (track.url && track.url.toLowerCase().endsWith('.flac')) return 'FLAC';
+    if (track.url && track.url.toLowerCase().endsWith('.wav')) return 'WAV';
+    return 'Hi-Res';
+  };
+
+  // Artistas y Álbumes destacados dinámicos o simulados
+  const topArtists =
+    tracks.length > 0
+      ? Array.from(new Set(tracks.map((t) => t.artist).filter((a) => a && a !== 'Unknown Artist'))).slice(0, 8)
+      : ['alleh, Yorghaki', 'Bad Bunny', 'Myke Towers', 'Tito El Bambino', 'Blessd', 'J Balvin'];
+
+  const topAlbums =
+    tracks.length > 0
+      ? Array.from(new Set(tracks.map((t) => t.album || t.title).filter(Boolean))).slice(0, 8)
+      : ['Loco de Amor', 'DeBÍ TiRAR MáS FOToS', 'capaz (merengueton)', 'Otro Show', 'Verde'];
+
+  const getArtistArtwork = (artistName: string) => {
+    const found = tracks.find((t) => t.artist === artistName && t.artwork);
+    return found?.artwork;
+  };
+
+  const getAlbumArtwork = (albumTitle: string) => {
+    const found = tracks.find((t) => (t.album === albumTitle || t.title === albumTitle) && t.artwork);
+    return found?.artwork;
+  };
+
+  // Estilo de tarjeta Glassmorphism translúcido (Apple Music Glass)
+  const glassCardStyle = {
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    borderWidth: 0.5,
+    borderColor: 'rgba(255, 255, 255, 0.12)',
+  };
+
+  const glassBannerStyle = {
+    backgroundColor: 'rgba(255, 255, 255, 0.07)',
+    borderWidth: 0.5,
+    borderColor: 'rgba(255, 255, 255, 0.15)',
+  };
+
+  // -------------------------------------------------------------
+  // VISTA SUB-PANTALLAS DE DETALLE (Historial, Recientes, Más reproducidas)
+  // -------------------------------------------------------------
+  if (activeSubScreen !== 'home') {
+    const subTracks = getSubScreenTracks();
+
+    return (
+      <View style={[StyleSheet.absoluteFill, { backgroundColor: '#000000' }]} className="flex-1 bg-black">
+        {/* Cabecera Negra Sólida con Flecha de Retroceso y Estilo Apple Music */}
+        <View className="flex-row items-center justify-between px-5 pt-14 pb-4 bg-black border-b border-white/10">
+          <TouchableOpacity
+            onPress={() => setActiveSubScreen('home')}
+            hitSlop={{ top: 15, bottom: 15, left: 15, right: 15 }}
+            className="p-1.5"
+          >
+            <ArrowLeft size={24} color="#FFFFFF" />
+          </TouchableOpacity>
+          <Text className="text-xl font-extrabold text-white tracking-tight">{getSubScreenTitle()}</Text>
+          <TouchableOpacity hitSlop={{ top: 15, bottom: 15, left: 15, right: 15 }} className="p-1.5">
+            <MoreVertical size={22} color="#ef4444" />
+          </TouchableOpacity>
+        </View>
+
+        {/* Dos Botones de Acción Rápida Minimalistas (Reproducir translúcido y Aleatorio en contraste) */}
+        <View className="flex-row items-center gap-3.5 px-5 py-4 bg-black border-b border-white/5">
+          {/* Botón Reproducir (Glassmorphism sutil) */}
+          <TouchableOpacity
+            onPress={() => {
+              if (subTracks.length > 0) onSelectTrack(subTracks[0]);
+              else onScanLocal();
+            }}
+            activeOpacity={0.8}
+            className="flex-1 flex-row items-center justify-center py-3 px-6 rounded-full bg-white/10 border border-white/20 gap-2 shadow-sm"
+          >
+            <Play size={18} color="#FFFFFF" fill="#FFFFFF" />
+            <Text className="text-white font-bold text-base tracking-tight">Reproducir</Text>
+          </TouchableOpacity>
+
+          {/* Botón Aleatorio (Sólido Blanco o Celeste brillante para invitar a la acción) */}
+          <TouchableOpacity
+            onPress={() => {
+              if (subTracks.length > 0) {
+                const randomIdx = Math.floor(Math.random() * subTracks.length);
+                onSelectTrack(subTracks[randomIdx]);
+              } else {
+                onScanLocal();
+              }
+            }}
+            activeOpacity={0.85}
+            className="flex-1 flex-row items-center justify-center py-3 px-6 rounded-full bg-white gap-2 shadow-md"
+          >
+            <Shuffle size={18} color="#000000" />
+            <Text className="text-black font-bold text-base tracking-tight">Aleatorio</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Lista Compacta de Canciones estilo Apple Music con Badges explícitos / Hi-Res */}
+        <Animated.ScrollView
+          showsVerticalScrollIndicator={false}
+          contentContainerStyle={{ paddingBottom: 130, paddingHorizontal: 20 }}
+          className="flex-1 bg-black pt-2"
         >
-          <Menu size={22} color={colors.foreground} />
-        </TouchableOpacity>
+          {subTracks.length === 0 ? (
+            <View className="items-center justify-center py-20 px-4">
+              <Disc size={52} color="#3F3F46" />
+              <Text className="text-white font-bold text-base mt-4 text-center">
+                Ninguna pista disponible aquí
+              </Text>
+              <Text className="text-gray-400 text-xs mt-1 text-center leading-relaxed">
+                Pulsa en escanear para añadir e indexar tu colección de audio de alta fidelidad.
+              </Text>
+            </View>
+          ) : (
+            subTracks.map((track) => {
+              const isCurrent = currentTrackId === track.id;
+              const displayArtwork = (track as any).artwork_thumb || track.artwork;
+              const qualityLabel = getTrackQualityLabel(track);
 
-        <View className="items-center">
-          <Text className="text-xs font-black tracking-widest text-[var(--muted-foreground)] uppercase">
-            Local Hi-Res Catalog
-          </Text>
-          <Text className="text-lg font-black tracking-wide text-[var(--foreground)]">
-            MILLA LIBRARY
-          </Text>
-        </View>
-
-        <View className="w-10 h-10 rounded-xl bg-[var(--primary)]/15 border border-[var(--primary)]/40 items-center justify-center">
-          <Disc size={20} color={colors.primary} />
-        </View>
+              return (
+                <TouchableOpacity
+                  key={track.id}
+                  onPress={() => onSelectTrack(track)}
+                  activeOpacity={0.8}
+                  className="flex-row items-center justify-between py-3.5 border-b border-white/10"
+                >
+                  <View className="flex-row items-center flex-1 mr-3">
+                    <View className="w-12 h-12 rounded-xl bg-neutral-900 border border-white/10 overflow-hidden mr-3.5 justify-center items-center shadow-sm">
+                      {displayArtwork ? (
+                        <Image source={{ uri: displayArtwork }} className="w-full h-full" resizeMode="cover" />
+                      ) : (
+                        <Disc size={24} color="#6B7280" />
+                      )}
+                    </View>
+                    <View className="flex-1 justify-center">
+                      <View className="flex-row items-center gap-1.5 pr-2">
+                        <Text
+                          className={`text-sm font-semibold tracking-tight truncate flex-1 ${
+                            isCurrent ? 'text-sky-400 font-bold' : 'text-white'
+                          }`}
+                          numberOfLines={1}
+                        >
+                          {track.title}
+                        </Text>
+                        {/* Badge de Calidad / Etiqueta estilo Apple Music [FLAC / Hi-Res / E] */}
+                        <View className="bg-neutral-800 border border-neutral-700/80 px-1.5 py-0.5 rounded flex-row items-center">
+                          <Text className="text-[9px] font-bold text-gray-300 uppercase tracking-wider">
+                            {qualityLabel}
+                          </Text>
+                        </View>
+                      </View>
+                      <Text className="text-xs font-medium text-gray-400 mt-0.5 truncate" numberOfLines={1}>
+                        {track.artist} {track.album ? `• ${track.album}` : ''}
+                      </Text>
+                    </View>
+                  </View>
+                  <TouchableOpacity hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} className="p-2">
+                    <MoreVertical size={18} color="#9CA3AF" />
+                  </TouchableOpacity>
+                </TouchableOpacity>
+              );
+            })
+          )}
+        </Animated.ScrollView>
       </View>
+    );
+  }
 
-      <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 120 }}>
-        
-        {/* Selector Rápido de 10 Temas Monochrome */}
-        <View className="mt-2 mb-6">
-          <View className="flex-row items-center gap-2 px-5 mb-3">
-            <Palette size={14} color={colors.mutedForeground} />
-            <Text className="text-xs font-bold tracking-wider text-[var(--muted-foreground)] uppercase">
-              Monochrome Themes ({THEME_LIST.length})
+  // -------------------------------------------------------------
+  // VISTA PRINCIPAL HOME ('home') - APPLE MUSIC GLASSMORPHISM FUSION
+  // -------------------------------------------------------------
+  return (
+    <View style={[StyleSheet.absoluteFill, { backgroundColor: '#000000' }]} className="flex-1 bg-black">
+      
+      {/* CABECERA FLOTANTE ANIMADA (AnimatedHeader) */}
+      <AnimatedHeader 
+        title="Inicio" 
+        headerTranslationY={headerTranslationY} 
+        onOpenSidebar={onOpenSidebar} 
+      />
+
+      {/* CONTENIDO PRINCIPAL CON SCROLL ANIMADO */}
+      <Animated.ScrollView
+        onScroll={scrollHandler}
+        scrollEventThrottle={16}
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={{ paddingBottom: 130, paddingTop: 130 }}
+        className="flex-1 bg-black"
+      >
+        {/* 1. GRID DE ACCESOS RÁPIDOS ESTILO CRISTAL (Glassmorphism 2x2 Grid) */}
+        <View className="px-5 mb-8">
+          <View className="flex-row flex-wrap justify-between gap-y-3.5">
+            {/* 1. Historial */}
+            <TouchableOpacity
+              onPress={() => setActiveSubScreen('history')}
+              activeOpacity={0.85}
+              style={[glassCardStyle, { width: '48%' }]}
+              className="rounded-3xl p-4 flex-row items-center gap-3.5 shadow-lg"
+            >
+              <View className="w-10 h-10 rounded-2xl bg-white/10 border border-white/10 items-center justify-center shadow-sm">
+                <Clock size={20} color="#FFFFFF" />
+              </View>
+              <View className="flex-1 justify-center">
+                <Text className="text-sm font-bold text-white tracking-tight leading-tight" numberOfLines={1}>
+                  Historial
+                </Text>
+                <Text className="text-[11px] text-gray-400 font-medium mt-0.5" numberOfLines={1}>
+                  Últimas pistas
+                </Text>
+              </View>
+            </TouchableOpacity>
+
+            {/* 2. Añadidos recientemente */}
+            <TouchableOpacity
+              onPress={() => setActiveSubScreen('recent')}
+              activeOpacity={0.85}
+              style={[glassCardStyle, { width: '48%' }]}
+              className="rounded-3xl p-4 flex-row items-center gap-3.5 shadow-lg"
+            >
+              <View className="w-10 h-10 rounded-2xl bg-white/10 border border-white/10 items-center justify-center shadow-sm">
+                <FolderPlus size={20} color="#FFFFFF" />
+              </View>
+              <View className="flex-1 justify-center">
+                <Text className="text-sm font-bold text-white tracking-tight leading-tight" numberOfLines={1}>
+                  Recientes
+                </Text>
+                <Text className="text-[11px] text-gray-400 font-medium mt-0.5" numberOfLines={1}>
+                  Nuevas en DB
+                </Text>
+              </View>
+            </TouchableOpacity>
+
+            {/* 3. Más reproducidas */}
+            <TouchableOpacity
+              onPress={() => setActiveSubScreen('top_played')}
+              activeOpacity={0.85}
+              style={[glassCardStyle, { width: '48%' }]}
+              className="rounded-3xl p-4 flex-row items-center gap-3.5 shadow-lg"
+            >
+              <View className="w-10 h-10 rounded-2xl bg-white/10 border border-white/10 items-center justify-center shadow-sm">
+                <TrendingUp size={20} color="#FFFFFF" />
+              </View>
+              <View className="flex-1 justify-center">
+                <Text className="text-sm font-bold text-white tracking-tight leading-tight" numberOfLines={1}>
+                  Más oídas
+                </Text>
+                <Text className="text-[11px] text-gray-400 font-medium mt-0.5" numberOfLines={1}>
+                  Top selecciones
+                </Text>
+              </View>
+            </TouchableOpacity>
+
+            {/* 4. Mezcla por Beats (Sesión de Mezcla Inteligente) */}
+            <TouchableOpacity
+              onPress={() => {
+                if (tracks.length > 0) {
+                  const randomIdx = Math.floor(Math.random() * tracks.length);
+                  onSelectTrack(tracks[randomIdx]);
+                } else {
+                  onScanLocal();
+                }
+              }}
+              activeOpacity={0.85}
+              style={[glassCardStyle, { width: '48%' }]}
+              className="rounded-3xl p-4 flex-row items-center gap-3.5 shadow-lg"
+            >
+              <View className="w-10 h-10 rounded-2xl bg-orange-500/20 border border-orange-500/30 items-center justify-center shadow-sm">
+                <Zap size={20} color="#B43C12" />
+              </View>
+              <View className="flex-1 justify-center">
+                <Text className="text-sm font-bold text-white tracking-tight leading-tight" numberOfLines={1}>
+                  Mezcla por Beats
+                </Text>
+                <Text className="text-[11px] text-orange-400/90 font-medium mt-0.5" numberOfLines={1}>
+                  Sesión DJ
+                </Text>
+              </View>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        {/* 2. SECCIÓN "TOP SELECCIONES PARA TI" (Carousel de Sugerencias y Estaciones Apple Music) */}
+        <View className="mb-8">
+          <View className="flex-row items-center justify-between px-5 mb-3.5">
+            <Text className="text-xl font-bold text-white tracking-tight">
+              Top selecciones para ti
+            </Text>
+            <TouchableOpacity
+              onPress={onScanLocal}
+              disabled={isScanning}
+              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              className="p-1"
+            >
+              {isScanning ? (
+                <ActivityIndicator size="small" color="#38BDF8" />
+              ) : (
+                <RefreshCw size={18} color="#9CA3AF" />
+              )}
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={{ paddingHorizontal: 20, gap: 16 }}
+          >
+            {/* 1. Tarjeta Naranja: Creador de Mixtapes por Género Táctico */}
+            <TouchableOpacity
+              onPress={async () => {
+                const currentOrLast = tracks.find(t => t.id === currentTrackId) || tracks[0];
+                const genreOrArtist = currentOrLast?.genre || currentOrLast?.artist || 'Pop';
+                const genreTracks = await getTracksByGenre(genreOrArtist);
+                await startSessionPlaylist(
+                  genreTracks,
+                  `Mixtape Táctico: ${genreOrArtist}`
+                );
+              }}
+              activeOpacity={0.88}
+              style={glassBannerStyle}
+              className="w-56 h-64 rounded-3xl overflow-hidden relative shadow-2xl border border-white/20 p-5 justify-between"
+            >
+              <View className="absolute top-0 left-0 right-0 bottom-0 bg-gradient-to-tr from-orange-600 via-rose-500 to-amber-400 opacity-90" />
+
+              <View className="flex-row items-center justify-between z-10">
+                <View className="flex-row items-center gap-1.5 bg-black/30 px-2.5 py-1 rounded-full border border-white/20">
+                  <Radio size={12} color="#FFFFFF" />
+                  <Text className="text-[10px] font-bold text-white uppercase tracking-wider">
+                    Mixtape Táctico
+                  </Text>
+                </View>
+                <Text className="text-xs font-bold text-white/90 tracking-tight">
+                  AutoMix ON
+                </Text>
+              </View>
+
+              <View className="items-center justify-center my-auto z-10">
+                <View className="w-16 h-16 rounded-full bg-white/20 border border-white/40 items-center justify-center shadow-lg">
+                  <Disc size={28} color="#FFFFFF" />
+                </View>
+              </View>
+
+              <View className="z-10">
+                <Text className="text-xs font-semibold text-white/80 tracking-wide uppercase mb-0.5">
+                  Por Género
+                </Text>
+                <Text className="text-xl font-black text-white tracking-tight leading-tight">
+                  Mixtape de Género
+                </Text>
+              </View>
+            </TouchableOpacity>
+
+            {/* 2. Tarjeta Azul: Cápsula del Tiempo (Rescate de Olvidadas) */}
+            <TouchableOpacity
+              onPress={async () => {
+                const forgottenTracks = await getForgottenTracks();
+                await startSessionPlaylist(
+                  forgottenTracks,
+                  'Cápsula del Tiempo'
+                );
+              }}
+              activeOpacity={0.88}
+              style={glassBannerStyle}
+              className="w-56 h-64 rounded-3xl overflow-hidden relative shadow-2xl border border-white/20 p-5 justify-between"
+            >
+              <View className="absolute top-0 left-0 right-0 bottom-0 bg-gradient-to-tr from-blue-600 via-indigo-600 to-purple-500 opacity-90" />
+
+              <View className="flex-row items-center justify-between z-10">
+                <View className="flex-row items-center gap-1.5 bg-black/30 px-2.5 py-1 rounded-full border border-white/20">
+                  <Zap size={12} color="#FFFFFF" />
+                  <Text className="text-[10px] font-bold text-white uppercase tracking-wider">
+                    Rescate
+                  </Text>
+                </View>
+                <Text className="text-xs font-bold text-white/90 tracking-tight">
+                  AutoMix ON
+                </Text>
+              </View>
+
+              <View className="items-center justify-center my-auto z-10">
+                <View className="w-16 h-16 rounded-full bg-white/20 border border-white/40 items-center justify-center shadow-lg">
+                  <RefreshCw size={28} color="#FFFFFF" />
+                </View>
+              </View>
+
+              <View className="z-10">
+                <Text className="text-xs font-semibold text-white/80 tracking-wide uppercase mb-0.5">
+                  Cero reproducciones
+                </Text>
+                <Text className="text-xl font-black text-white tracking-tight leading-tight">
+                  Cápsula del Tiempo
+                </Text>
+              </View>
+            </TouchableOpacity>
+
+            {/* 3. Tarjeta Gris/Cristalina Fija: Rueda de Emociones (Vibra y Estado de Ánimo) */}
+            <TouchableOpacity
+              onPress={() => setIsEmotionModalOpen(true)}
+              activeOpacity={0.88}
+              style={glassBannerStyle}
+              className="w-56 h-64 rounded-3xl overflow-hidden relative shadow-2xl border border-white/15 p-5 justify-between bg-neutral-900/80"
+            >
+              <View className="absolute top-0 left-0 right-0 bottom-0 bg-white/[0.03]" />
+
+              <View className="flex-row items-center justify-between z-10">
+                <View className="flex-row items-center gap-1.5 bg-black/40 px-2.5 py-1 rounded-full border border-white/10">
+                  <Sparkles size={12} color="#B43C12" />
+                  <Text className="text-[10px] font-bold text-white uppercase tracking-wider">
+                    Estación IA
+                  </Text>
+                </View>
+                <Text className="text-xs font-bold text-gray-400 tracking-tight">
+                  Deezer Style
+                </Text>
+              </View>
+
+              <View className="items-center justify-center my-auto z-10">
+                <View className="w-16 h-16 rounded-full bg-white/10 border border-white/20 items-center justify-center shadow-lg">
+                  <Heart size={28} color="#B43C12" />
+                </View>
+              </View>
+
+              <View className="z-10">
+                <Text className="text-xs font-semibold text-gray-400 tracking-wide uppercase mb-0.5">
+                  Selector de Estado
+                </Text>
+                <Text className="text-xl font-black text-white tracking-tight leading-tight">
+                  Vibra y Ánimo
+                </Text>
+              </View>
+            </TouchableOpacity>
+          </ScrollView>
+        </View>
+
+        {/* 3. SECCIÓN "REPRODUCCIONES RECIENTES >" */}
+        <View className="mb-8">
+          <TouchableOpacity
+            onPress={() => setActiveSubScreen('history')}
+            activeOpacity={0.8}
+            className="flex-row items-center justify-between px-5 mb-3.5"
+          >
+            <Text className="text-xl font-bold text-white tracking-tight">
+              Reproducciones recientes
+            </Text>
+            <ArrowRight size={20} color="#9CA3AF" />
+          </TouchableOpacity>
+
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={{ paddingHorizontal: 20, gap: 16 }}
+          >
+            {tracks.length > 0
+              ? tracks.slice(0, 6).map((track) => {
+                  const displayArtwork = (track as any).artwork_thumb || track.artwork;
+                  const qualityLabel = getTrackQualityLabel(track);
+
+                  return (
+                    <TouchableOpacity
+                      key={`recent-${track.id}`}
+                      onPress={() => onSelectTrack(track)}
+                      activeOpacity={0.85}
+                      className="w-36"
+                    >
+                      <View className="w-36 h-36 rounded-2xl bg-neutral-900 border border-white/10 overflow-hidden relative shadow-lg items-center justify-center mb-2">
+                        {displayArtwork ? (
+                          <Image source={{ uri: displayArtwork }} className="w-full h-full" resizeMode="cover" />
+                        ) : (
+                          <Disc size={36} color="#6B7280" />
+                        )}
+                      </View>
+
+                      <View className="flex-row items-center gap-1.5 w-full">
+                        <Text className="text-sm font-semibold text-white tracking-tight truncate flex-1" numberOfLines={1}>
+                          {track.title}
+                        </Text>
+                        <View className="bg-neutral-800 border border-neutral-700 px-1 py-0.5 rounded">
+                          <Text className="text-[9px] font-bold text-gray-300 uppercase">
+                            {qualityLabel}
+                          </Text>
+                        </View>
+                      </View>
+
+                      <Text className="text-xs text-gray-400 font-medium mt-0.5 truncate w-full" numberOfLines={1}>
+                        {track.artist}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })
+              : [1, 2, 3].map((_, idx) => (
+                  <View key={`recent-ph-${idx}`} className="w-36">
+                    <View className="w-36 h-36 rounded-2xl bg-neutral-900/60 border border-white/10 justify-center items-center p-3 mb-2">
+                      <Disc size={32} color="#4B5563" />
+                    </View>
+                    <Text className="text-xs text-gray-500 font-medium truncate">Sin recientes</Text>
+                  </View>
+                ))}
+          </ScrollView>
+        </View>
+
+        {/* 4. SECCIÓN "ENCUENTRA TU ESTADO DE ÁNIMO" */}
+        <View className="mb-8">
+          <View className="flex-row items-center justify-between px-5 mb-3.5">
+            <Text className="text-xl font-bold text-white tracking-tight">
+              Encuentra tu estado de ánimo
             </Text>
           </View>
 
           <ScrollView
             horizontal
             showsHorizontalScrollIndicator={false}
-            contentContainerStyle={{ paddingHorizontal: 20, gap: 10 }}
+            contentContainerStyle={{ paddingHorizontal: 20, gap: 14 }}
           >
-            {THEME_LIST.map((t) => {
-              const isSelected = currentTheme === t.id;
+            {/* Energy */}
+            <TouchableOpacity
+              onPress={() => {
+                if (tracks.length > 0) onSelectTrack(tracks[0]);
+                else onScanLocal();
+              }}
+              activeOpacity={0.88}
+              className="w-36 h-36 rounded-2xl overflow-hidden p-4 justify-between border border-white/15 bg-emerald-600/80 shadow-lg"
+            >
+              <Text className="text-[10px] font-bold text-white/90 uppercase self-end tracking-wider">
+                Milla Mood
+              </Text>
+              <Zap size={44} color="#FFFFFF" strokeWidth={1.2} className="self-center my-auto" />
+              <Text className="text-sm font-bold text-white tracking-tight">Energy</Text>
+            </TouchableOpacity>
+
+            {/* Feeling Blue */}
+            <TouchableOpacity
+              onPress={() => {
+                if (tracks.length > 0) onSelectTrack(tracks[0]);
+                else onScanLocal();
+              }}
+              activeOpacity={0.88}
+              className="w-36 h-36 rounded-2xl overflow-hidden p-4 justify-between border border-white/15 bg-blue-600/80 shadow-lg"
+            >
+              <Text className="text-[10px] font-bold text-white/90 uppercase self-end tracking-wider">
+                Milla Mood
+              </Text>
+              <Disc size={44} color="#FFFFFF" strokeWidth={1.2} className="self-center my-auto" />
+              <Text className="text-sm font-bold text-white tracking-tight">Feeling Blue</Text>
+            </TouchableOpacity>
+
+            {/* Relax */}
+            <TouchableOpacity
+              onPress={() => {
+                if (tracks.length > 0) onSelectTrack(tracks[0]);
+                else onScanLocal();
+              }}
+              activeOpacity={0.88}
+              className="w-36 h-36 rounded-2xl overflow-hidden p-4 justify-between border border-white/15 bg-amber-600/80 shadow-lg"
+            >
+              <Text className="text-[10px] font-bold text-white/90 uppercase self-end tracking-wider">
+                Milla Mood
+              </Text>
+              <Heart size={44} color="#FFFFFF" strokeWidth={1.2} className="self-center my-auto" />
+              <Text className="text-sm font-bold text-white tracking-tight">Relax & Vibe</Text>
+            </TouchableOpacity>
+          </ScrollView>
+        </View>
+
+        {/* 5. SECCIÓN "NOVEDADES" (New This Week & Recent Releases) */}
+        <View className="mb-8">
+          <View className="flex-row items-center justify-between px-5 mb-3.5">
+            <Text className="text-xl font-bold text-white tracking-tight">Novedades</Text>
+            <TouchableOpacity hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} className="p-1">
+              <ArrowRight size={20} color="#9CA3AF" />
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={{ paddingHorizontal: 20, gap: 16 }}
+          >
+            {tracks.length > 0
+              ? [...tracks].reverse().slice(0, 8).map((track) => {
+                  const displayArtwork = (track as any).artwork_thumb || track.artwork;
+                  const qualityLabel = getTrackQualityLabel(track);
+
+                  return (
+                    <TouchableOpacity
+                      key={`news-${track.id}`}
+                      onPress={() => onSelectTrack(track)}
+                      activeOpacity={0.85}
+                      className="w-36"
+                    >
+                      <View className="w-36 h-36 rounded-2xl bg-neutral-900 border border-white/10 overflow-hidden relative shadow-lg items-center justify-center mb-2">
+                        {displayArtwork ? (
+                          <Image source={{ uri: displayArtwork }} className="w-full h-full" resizeMode="cover" />
+                        ) : (
+                          <Disc size={36} color="#6B7280" />
+                        )}
+                      </View>
+
+                      <View className="flex-row items-center gap-1.5 w-full">
+                        <Text className="text-sm font-semibold text-white tracking-tight truncate flex-1" numberOfLines={1}>
+                          {track.title}
+                        </Text>
+                      </View>
+
+                      <Text className="text-xs text-gray-400 font-medium mt-0.5 truncate w-full" numberOfLines={1}>
+                        {(track.artist === 'Local Library' || track.artist === 'Unknown Artist') ? 'Unknown Artist' : track.artist}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })
+              : [1, 2, 3].map((_, idx) => (
+                  <View key={`news-ph-${idx}`} className="w-36">
+                    <View className="w-36 h-36 rounded-2xl bg-neutral-900/60 border border-white/10 justify-center items-center p-3 mb-2">
+                      <Disc size={32} color="#4B5563" />
+                    </View>
+                    <Text className="text-xs text-gray-500 font-medium truncate">Sin novedades</Text>
+                  </View>
+                ))}
+          </ScrollView>
+        </View>
+
+        {/* 6. SECCIÓN "TOP ARTISTS" */}
+        <View className="mb-8">
+          <View className="flex-row items-center justify-between px-5 mb-3.5">
+            <Text className="text-xl font-bold text-white tracking-tight">Top artists</Text>
+            <TouchableOpacity hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} className="p-1">
+              <ArrowRight size={20} color="#9CA3AF" />
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={{ paddingHorizontal: 20, gap: 20 }}
+          >
+            {topArtists.map((artistName, idx) => {
+              const artistImg = getArtistArtwork(artistName);
               return (
-                <TouchableOpacity
-                  key={t.id}
-                  onPress={() => onSelectTheme(t.id)}
-                  activeOpacity={0.8}
-                  className={`flex-row items-center gap-2 px-3.5 py-2 rounded-full border transition-all ${
-                    isSelected
-                      ? 'bg-[var(--primary)] border-[var(--primary)] shadow-md'
-                      : 'bg-[var(--card)]/80 border-[var(--border)]/60'
-                  }`}
-                >
-                  <View
-                    style={{ backgroundColor: t.color, borderColor: t.border, borderWidth: 1.5 }}
-                    className="w-3.5 h-3.5 rounded-full"
-                  />
-                  <Text
-                    className={`text-xs font-bold ${
-                      isSelected
-                        ? 'text-[var(--primary-foreground)] font-black'
-                        : 'text-[var(--foreground)]'
-                    }`}
-                  >
-                    {t.name}
+                <TouchableOpacity key={`${artistName}-${idx}`} className="items-center w-24 active:opacity-85">
+                  <View className="w-24 h-24 rounded-full bg-neutral-900 border border-white/15 overflow-hidden mb-2 justify-center items-center shadow-md">
+                    {artistImg ? (
+                      <Image source={{ uri: artistImg }} className="w-full h-full" resizeMode="cover" />
+                    ) : (
+                      <User size={36} color="#9CA3AF" />
+                    )}
+                  </View>
+                  <Text className="text-xs font-semibold text-gray-300 text-center w-full" numberOfLines={1}>
+                    {artistName}
                   </Text>
                 </TouchableOpacity>
               );
@@ -191,175 +798,160 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           </ScrollView>
         </View>
 
-        {/* Sección Destacada / Banner */}
-        <View className="mx-5 mb-8 p-6 rounded-3xl bg-[var(--card)]/80 border border-[var(--border)]/80 shadow-2xl overflow-hidden">
-          <View className="flex-row items-center gap-2 mb-2">
-            <Sparkles size={16} color={colors.primary} />
-            <Text className="text-xs font-bold uppercase tracking-widest text-[var(--primary)]">
-              Pure Native Engine
+        {/* Tarjeta de notificación y reparación si hay pistas pendientes */}
+        <NotificationCard
+          tracksNeedingRepair={tracksNeedingRepair}
+          onOptimize={onOptimize}
+          isOptimizing={isOptimizing}
+        />
+
+        {/* Panel Inferior: Estado del Motor de Audio y Escaneo Rápido */}
+        <View
+          style={glassCardStyle}
+          className="mx-5 mb-6 p-4 rounded-3xl flex-row items-center justify-between shadow-xl"
+        >
+          <View className="flex-1 mr-3">
+            <Text className="text-xs font-bold text-white tracking-wide">
+              {isScanning ? 'Sincronizando Biblioteca...' : 'Milla Native Audio Engine'}
+            </Text>
+            <Text className="text-[11px] text-gray-400 mt-0.5" numberOfLines={1}>
+              {isScanning
+                ? (scanProgressText || 'Escaneando archivos de audio compatibles...')
+                : `${tracks.length} archivo(s) indexados en SQLite local`}
             </Text>
           </View>
-          <Text className="text-2xl font-black text-[var(--foreground)] leading-tight">
-            Lossless FLAC & DSD Playback
-          </Text>
-          <Text className="text-xs text-[var(--muted-foreground)] mt-2 leading-relaxed">
-            Milla se conecta directamente a la arquitectura de audio nativa de tu dispositivo, eliminando el remuestreo del navegador. Escanea tu biblioteca local para encontrar archivos de alta resolución.
-          </Text>
-
-          {/* Botón de Escaneo Local */}
           <TouchableOpacity
             onPress={onScanLocal}
             disabled={isScanning}
-            className="mt-5 py-3 px-4 rounded-xl bg-[var(--primary)] items-center justify-center flex-row gap-2 shadow-lg"
-            style={{ opacity: isScanning ? 0.7 : 1 }}
+            className="px-4 py-2.5 rounded-2xl bg-white/10 border border-white/20 flex-row items-center gap-1.5"
           >
             {isScanning ? (
-              <ActivityIndicator size="small" color={colors.primaryForeground} />
+              <ActivityIndicator size="small" color="#FFFFFF" />
             ) : (
-              <FolderOpen size={16} color={colors.primaryForeground} />
+              <FolderOpen size={15} color="#FFFFFF" />
             )}
-            <Text className="text-xs font-black uppercase tracking-wider text-[var(--primary-foreground)]">
-              {isScanning ? 'Scanning Music...' : 'Scan Local Music Library'}
+            <Text className="text-xs font-bold text-white">
+              {isScanning ? 'Escaneando' : 'Escanear'}
             </Text>
           </TouchableOpacity>
         </View>
+      </Animated.ScrollView>
 
-        {/* Tarjeta de Reparación de Metadatos (Se muestra solo si hay pistas dañadas) */}
-        {tracksNeedingRepair > 0 && (
-          <View className="mx-5 mb-8 p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex-row items-center shadow-sm">
-            <View className="w-10 h-10 rounded-full bg-amber-500/20 items-center justify-center mr-3">
-              <AlertTriangle size={20} color="#f59e0b" />
-            </View>
-            <View className="flex-1">
-              <Text className="text-sm font-black text-amber-500 tracking-wide">
-                METADATOS INCOMPLETOS
+      {/* Modal Traslúcido: Rueda de Emociones (Estilo Deezer / Apple Music) */}
+      <Modal
+        visible={isEmotionModalOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setIsEmotionModalOpen(false)}
+      >
+        <TouchableOpacity
+          activeOpacity={1}
+          onPress={() => setIsEmotionModalOpen(false)}
+          className="flex-1 bg-black/80 justify-center items-center px-6"
+        >
+          <TouchableOpacity
+            activeOpacity={1}
+            onPress={() => {}}
+            className="w-full bg-neutral-900/95 rounded-3xl p-6 border border-white/15 shadow-2xl max-w-sm"
+          >
+            <View className="items-center mb-6">
+              <View className="w-12 h-12 rounded-full bg-orange-600/20 border border-orange-500/30 items-center justify-center mb-3">
+                <Sparkles size={24} color="#B43C12" />
+              </View>
+              <Text className="text-xl font-black text-white text-center">
+                Rueda de Emociones
               </Text>
-              <Text className="text-xs font-medium text-[var(--muted-foreground)] mt-0.5">
-                {tracksNeedingRepair} pista(s) necesitan reparación.
+              <Text className="text-xs text-gray-400 text-center mt-1">
+                Selecciona tu estado de ánimo o vibra actual para generar una mezcla instantánea con AutoMix forzado.
               </Text>
             </View>
-            <TouchableOpacity className="py-2 px-3 rounded-lg bg-amber-500 flex-row items-center gap-1.5 shadow-md">
-              <Hammer size={14} color="#ffffff" />
-              <Text className="text-xs font-black text-white uppercase">Reparar</Text>
+
+            <View className="gap-3">
+              <TouchableOpacity
+                onPress={async () => {
+                  setIsEmotionModalOpen(false);
+                  const emotionTracks = await getTracksByEmotion('fiesta');
+                  await startSessionPlaylist(emotionTracks, '🎉 Rueda de Emociones: Fiesta');
+                }}
+                className="flex-row items-center gap-3 bg-white/5 p-4 rounded-2xl border border-white/10 active:bg-white/10"
+              >
+                <Text className="text-2xl">🎉</Text>
+                <View className="flex-1">
+                  <Text className="text-base font-bold text-white">Fiesta</Text>
+                  <Text className="text-xs text-gray-400">BPM altos, ritmos movidos y energía</Text>
+                </View>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                onPress={async () => {
+                  setIsEmotionModalOpen(false);
+                  const emotionTracks = await getTracksByEmotion('triste');
+                  await startSessionPlaylist(emotionTracks, '😭 Rueda de Emociones: Triste');
+                }}
+                className="flex-row items-center gap-3 bg-white/5 p-4 rounded-2xl border border-white/10 active:bg-white/10"
+              >
+                <Text className="text-2xl">😭</Text>
+                <View className="flex-1">
+                  <Text className="text-base font-bold text-white">Triste</Text>
+                  <Text className="text-xs text-gray-400">BPM bajos, acústicos y baladas</Text>
+                </View>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                onPress={async () => {
+                  setIsEmotionModalOpen(false);
+                  const emotionTracks = await getTracksByEmotion('alegre');
+                  await startSessionPlaylist(emotionTracks, '😊 Rueda de Emociones: Alegre');
+                }}
+                className="flex-row items-center gap-3 bg-white/5 p-4 rounded-2xl border border-white/10 active:bg-white/10"
+              >
+                <Text className="text-2xl">😊</Text>
+                <View className="flex-1">
+                  <Text className="text-base font-bold text-white">Alegre</Text>
+                  <Text className="text-xs text-gray-400">Tonalidades armónicas mayores y pop</Text>
+                </View>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                onPress={async () => {
+                  setIsEmotionModalOpen(false);
+                  const emotionTracks = await getTracksByEmotion('enamorado');
+                  await startSessionPlaylist(emotionTracks, '❤️ Rueda de Emociones: Enamorado');
+                }}
+                className="flex-row items-center gap-3 bg-white/5 p-4 rounded-2xl border border-white/10 active:bg-white/10"
+              >
+                <Text className="text-2xl">❤️</Text>
+                <View className="flex-1">
+                  <Text className="text-base font-bold text-white">Enamorado</Text>
+                  <Text className="text-xs text-gray-400">Subgéneros melódicos y románticos</Text>
+                </View>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                onPress={async () => {
+                  setIsEmotionModalOpen(false);
+                  const emotionTracks = await getTracksByEmotion('relax');
+                  await startSessionPlaylist(emotionTracks, '☕ Rueda de Emociones: Relax');
+                }}
+                className="flex-row items-center gap-3 bg-white/5 p-4 rounded-2xl border border-white/10 active:bg-white/10"
+              >
+                <Text className="text-2xl">☕</Text>
+                <View className="flex-1">
+                  <Text className="text-base font-bold text-white">Relax</Text>
+                  <Text className="text-xs text-gray-400">Música ambiental, downtempo o chill</Text>
+                </View>
+              </TouchableOpacity>
+            </View>
+
+            <TouchableOpacity
+              onPress={() => setIsEmotionModalOpen(false)}
+              className="mt-5 py-3 bg-white/10 rounded-xl items-center"
+            >
+              <Text className="text-sm font-semibold text-white">Cerrar</Text>
             </TouchableOpacity>
-          </View>
-        )}
-
-        {/* Cuadrícula de Pistas / Álbumes */}
-        <View className="px-5">
-          <Text className="text-base font-black tracking-wide text-[var(--foreground)] mb-4">
-            {tracks.length > SAMPLE_CATALOG.length ? 'YOUR MUSIC LIBRARY' : 'FEATURED HI-RES ALBUMS'}
-          </Text>
-
-          <View className="flex-row flex-wrap justify-between gap-y-6">
-            {tracks.map((track) => {
-              const isCurrent = currentTrackId === track.id;
-              const isDownloaded = downloadedIds.has(track.id);
-              const progressVal = downloadProgress[track.id];
-
-              // Usar miniatura optimizada en la lista para 120Hz fluido
-              const displayArtwork = (track as any).artwork_thumb || track.artwork;
-
-              return (
-                <TouchableOpacity
-                  key={track.id}
-                  style={{ width: CARD_WIDTH }}
-                  activeOpacity={0.85}
-                  onPress={() => onSelectTrack(track)}
-                  className={`rounded-2xl p-3 bg-[var(--card)]/90 border transition-all shadow-lg ${
-                    isCurrent
-                      ? 'border-[var(--primary)] border-2 shadow-2xl'
-                      : 'border-[var(--border)]/60'
-                  }`}
-                >
-                  {/* Carátula del Álbum */}
-                  <View className="w-full aspect-square rounded-xl overflow-hidden bg-[var(--secondary)] mb-3 relative shadow-md">
-                    {displayArtwork ? (
-                      <Image
-                        source={{ uri: displayArtwork }}
-                        className="w-full h-full"
-                        resizeMode="cover"
-                      />
-                    ) : (
-                      <View className="w-full h-full justify-center items-center bg-[var(--muted)]">
-                        <Disc size={40} color={colors.mutedForeground} />
-                      </View>
-                    )}
-                    
-                    {/* Botón Flotante de Play */}
-                    <View className="absolute bottom-2 right-2 w-10 h-10 rounded-full bg-[var(--primary)] items-center justify-center shadow-lg">
-                      <Play
-                         size={18}
-                        color={colors.primaryForeground}
-                        fill={colors.primaryForeground}
-                        style={{ marginLeft: 2 }}
-                      />
-                    </View>
-
-                    {/* Botón de Descarga / Estado Offline */}
-                    {track.id.startsWith('track-') && (
-                      <View className="absolute top-2 right-2 z-20">
-                        {isDownloaded ? (
-                          <View className="w-6 h-6 rounded-full bg-green-500 items-center justify-center border border-white/20">
-                            <ArrowDownToLine size={12} color="#ffffff" />
-                          </View>
-                        ) : progressVal !== undefined ? (
-                          <View className="w-6 h-6 rounded-full bg-black/60 items-center justify-center border border-[var(--primary)]">
-                            <Text className="text-[8px] font-black text-[var(--primary)]">
-                              {Math.round(progressVal * 100)}%
-                            </Text>
-                          </View>
-                        ) : (
-                          <TouchableOpacity
-                            onPress={(e) => {
-                              e.stopPropagation(); // Prevenir abrir el reproductor
-                              onDownloadTrack(track);
-                            }}
-                            activeOpacity={0.7}
-                            className="w-6 h-6 rounded-full bg-black/60 items-center justify-center border border-white/20"
-                          >
-                            <Download size={12} color="#ffffff" />
-                          </TouchableOpacity>
-                        )}
-                      </View>
-                    )}
-
-                    {/* Insignia en imagen */}
-                    {isCurrent && (
-                      <View className="absolute top-2 left-2 px-2 py-0.5 rounded bg-black/80 border border-white/20">
-                        <Text className="text-[9px] font-black text-white uppercase">Playing</Text>
-                      </View>
-                    )}
-                  </View>
-
-                  <Text
-                    className="text-sm font-bold text-[var(--foreground)] tracking-tight"
-                    numberOfLines={1}
-                  >
-                    {track.title}
-                  </Text>
-                  <Text
-                    className="text-xs font-medium text-[var(--muted-foreground)] mt-0.5"
-                    numberOfLines={1}
-                  >
-                    {track.artist}
-                  </Text>
-                  <View className="mt-2 pt-2 border-t border-[var(--border)]/40 flex-row justify-between items-center">
-                    <Text className="text-[9px] font-bold text-[var(--primary)] uppercase tracking-wider">
-                      {isDownloaded ? 'Offline FLAC' : (track.qualityBadge?.split(' ')[0] || 'FLAC')}
-                    </Text>
-                    <Text className="text-[10px] text-[var(--muted-foreground)]">
-                      {Math.floor((track.duration || 0) / 60)}:{((track.duration || 0) % 60).toString().padStart(2, '0')}
-                    </Text>
-                  </View>
-                </TouchableOpacity>
-              );
-            })}
-          </View>
-        </View>
-
-      </ScrollView>
+          </TouchableOpacity>
+        </TouchableOpacity>
+      </Modal>
     </View>
   );
 };
-

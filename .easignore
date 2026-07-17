@@ -1,6 +1,10 @@
 node_modules/
 .expo/
 .git/
+.claude/
+.npm-cache/
+.monochrome-src/
+backend/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
