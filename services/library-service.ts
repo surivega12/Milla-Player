@@ -31,6 +31,41 @@ function getFileQualityBadge(filename: string): string {
   return `${ext.toUpperCase() || 'AUDIO'} Universal`;
 }
 
+/**
+ * Decodifica URIs de forma segura anti-crashes por secuencias % malformadas.
+ */
+function decodeURIComponentSafe(uri: string): string {
+  if (!uri) return '';
+  try {
+    return decodeURIComponent(uri);
+  } catch (err) {
+    try {
+      return unescape(uri);
+    } catch (e) {
+      return uri;
+    }
+  }
+}
+
+/**
+ * Normaliza y formatea URIs nativas devueltas por el selector de carpetas (Storage Access Framework / FileSystem)
+ * para resolver subcarpetas con prefijos content:// o file:// en compilaciones de producción (.apk).
+ */
+export function normalizeNativeUri(uri: string): string {
+  if (!uri) return '';
+  const decoded = decodeURIComponentSafe(uri);
+  if (decoded.startsWith('content://')) {
+    return decoded;
+  }
+  if (decoded.startsWith('file://')) {
+    return decoded;
+  }
+  if (decoded.startsWith('/')) {
+    return `file://${decoded}`;
+  }
+  return decoded;
+}
+
 const generateThumbnail = async (base64Image: string, trackId: string): Promise<{ original: string, thumb: string } | null> => {
   try {
     const safeId = trackId.replace(/[^a-z0-9]/gi, '_');
@@ -59,7 +94,7 @@ const generateThumbnail = async (base64Image: string, trackId: string): Promise<
  * Helper para generar huella única anti-duplicados usando nombre de archivo + duración exacta en milisegundos.
  */
 function getTrackFingerprint(filename: string, durationSec?: number): string {
-  const cleanName = filename.trim().toLowerCase().replace(/\.[^/.]+$/, '');
+  const cleanName = decodeURIComponentSafe(filename).trim().toLowerCase().replace(/\.[^/.]+$/, '');
   const durationMs = Math.round((durationSec || 0) * 1000);
   return `${cleanName}_${durationMs}`;
 }
@@ -71,7 +106,7 @@ async function findAndLinkLyricsNative(asset: any): Promise<string | null> {
   if (Platform.OS === 'web') return null;
   try {
     let fileUri = asset.uri;
-    if (!fileUri.startsWith('file://')) {
+    if (!fileUri.startsWith('file://') && !fileUri.startsWith('content://')) {
       try {
         const info = await MediaLibrary.getAssetInfoAsync(asset.id || asset);
         if (info && info.localUri) {
@@ -80,12 +115,12 @@ async function findAndLinkLyricsNative(asset: any): Promise<string | null> {
       } catch (e) {}
     }
 
-    if (fileUri && fileUri.startsWith('file://')) {
+    if (fileUri && (fileUri.startsWith('file://') || fileUri.startsWith('content://'))) {
       const lastSlashIdx = fileUri.lastIndexOf('/');
       if (lastSlashIdx !== -1) {
         const dirPath = fileUri.substring(0, lastSlashIdx + 1);
         const filename = asset.filename || fileUri.substring(lastSlashIdx + 1);
-        const baseName = decodeURIComponent(filename).replace(/\.[^/.]+$/, '');
+        const baseName = decodeURIComponentSafe(filename).replace(/\.[^/.]+$/, '');
 
         // 1. Verificar archivo con extensión .lrc
         const lrcPathEncoded = `${dirPath}${encodeURIComponent(baseName)}.lrc`;
@@ -146,7 +181,11 @@ async function scanWebFolderHybrid(
 
         if (onProgress) onProgress(`Analizando ${files.length} archivos de la carpeta...`, 0, files.length);
 
-        const audioFiles = files.filter(f => AUDIO_EXTENSIONS_REGEX.test(f.name) || f.type.startsWith('audio/'));
+        // Verificación en minúsculas tolerante
+        const audioFiles = files.filter(f => {
+          const nameLower = f.name.toLowerCase();
+          return AUDIO_EXTENSIONS_REGEX.test(nameLower) || ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'dsd', 'dff', 'dsf'].some(ext => nameLower.endsWith(`.${ext}`)) || f.type.startsWith('audio/');
+        });
         const lyricsFiles = files.filter(f => f.name.toLowerCase().endsWith('.lrc') || f.name.toLowerCase().endsWith('.txt'));
 
         if (audioFiles.length === 0) {
@@ -240,11 +279,100 @@ async function scanWebFolderHybrid(
 }
 
 /**
- * Escanea la biblioteca de audio local con procesamiento por lotes y soporte universal:
- * .mp3, .flac, .wav, .m4a, .aac, .ogg, .dsd, .dff junto con vinculación de letras .lrc/.txt.
+ * Escáner recursivo universal de carpetas (Storage Access Framework o file://) con bloques try-catch
+ * por cada subcarpeta e ítem para ignorar carpetas vacías o protegidas sin abortar el proceso.
+ */
+export async function readDirectoryRecursivelyNative(
+  dirUri: string,
+  onProgress?: (progressText: string, current: number, total?: number) => void,
+  collectedAssets: any[] = [],
+  visitedDirs: Set<string> = new Set()
+): Promise<any[]> {
+  if (!dirUri) return collectedAssets;
+  
+  const normalizedDir = normalizeNativeUri(dirUri);
+  if (visitedDirs.has(normalizedDir)) return collectedAssets;
+  visitedDirs.add(normalizedDir);
+
+  try {
+    if (normalizedDir.startsWith('content://')) {
+      const items = await FileSystem.StorageAccessFramework.readDirectoryAsync(normalizedDir);
+      for (let i = 0; i < items.length; i++) {
+        const itemUri = items[i];
+        if (onProgress && i % 10 === 0) {
+          onProgress(`Explorando carpeta (${collectedAssets.length} audios hallados)...`, collectedAssets.length);
+        }
+        try {
+          const decodedUri = decodeURIComponentSafe(itemUri);
+          const rawFilename = decodedUri.split('/').pop()?.split('%2F').pop()?.split('?')[0] || 'unknown';
+          const ext = rawFilename.split('.').pop()?.toLowerCase() || '';
+
+          const isAudioExt = ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'dsd', 'dff', 'dsf'].includes(ext);
+          if (isAudioExt) {
+            const info = await FileSystem.getInfoAsync(itemUri).catch(() => null);
+            collectedAssets.push({
+              uri: itemUri,
+              filename: decodeURIComponentSafe(rawFilename),
+              mediaType: 'audio',
+              duration: 180, // Duración inicial orientativa hasta extracción por metadata-service
+              size: (info as any)?.size || 0
+            });
+          } else {
+            const info = await FileSystem.getInfoAsync(itemUri).catch(() => null);
+            if (info && info.isDirectory) {
+              await readDirectoryRecursivelyNative(itemUri, onProgress, collectedAssets, visitedDirs);
+            }
+          }
+        } catch (subErr) {
+          // Bloque try-catch interno para cada subcarpeta o ítem del sistema: ignorar con gracia
+          console.warn(`[LibraryService] Ignorando subcarpeta/ítem protegido con gracia: ${itemUri}`, subErr);
+        }
+      }
+    } else {
+      const dirPath = normalizedDir.startsWith('file://') ? normalizedDir : `file://${normalizedDir}`;
+      const items = await FileSystem.readDirectoryAsync(dirPath);
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (onProgress && i % 10 === 0) {
+          onProgress(`Explorando carpeta (${collectedAssets.length} audios hallados)...`, collectedAssets.length);
+        }
+        try {
+          const itemPath = `${dirPath.endsWith('/') ? dirPath : dirPath + '/'}${item}`;
+          const info = await FileSystem.getInfoAsync(itemPath).catch(() => null);
+          if (info && info.isDirectory) {
+            await readDirectoryRecursivelyNative(itemPath, onProgress, collectedAssets, visitedDirs);
+          } else if (info && info.exists) {
+            const rawFilename = decodeURIComponentSafe(item);
+            const ext = rawFilename.split('.').pop()?.toLowerCase() || '';
+            const isAudioExt = ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'dsd', 'dff', 'dsf'].includes(ext);
+            if (isAudioExt) {
+              collectedAssets.push({
+                uri: itemPath,
+                filename: rawFilename,
+                mediaType: 'audio',
+                duration: 180,
+                size: (info as any).size || 0
+              });
+            }
+          }
+        } catch (subErr) {
+          console.warn(`[LibraryService] Ignorando subcarpeta/ítem protegido con gracia: ${item}`, subErr);
+        }
+      }
+    }
+  } catch (dirErr) {
+    console.warn(`[LibraryService] No se pudo leer directorio o carpeta protegida ${dirUri}:`, dirErr);
+  }
+  return collectedAssets;
+}
+
+/**
+ * Escanea la biblioteca de audio local con procesamiento por lotes, soporte universal y
+ * tolerancia completa de extensiones (minúsculas/mayúsculas) y carpetas protegidas.
  */
 export async function scanLocalAudioFiles(
-  onProgress?: (progressText: string, currentCount: number, totalCount?: number) => void
+  onProgress?: (progressText: string, currentCount: number, totalCount?: number) => void,
+  customFolderUri?: string
 ): Promise<Track[]> {
   if (Platform.OS === 'web') {
     return scanWebFolderHybrid(onProgress);
@@ -270,26 +398,36 @@ export async function scanLocalAudioFiles(
     }
   }
 
-  // 2. Paginación nativa para traer todos los audios del dispositivo sin desbordar memoria
+  // 2. Paginación nativa para traer todos los audios del dispositivo sin desbordar memoria o desde carpeta personalizada
   let allAssets: any[] = [];
-  let hasNextPage = true;
-  let afterCursor: string | undefined = undefined;
+  if (customFolderUri) {
+    allAssets = await readDirectoryRecursivelyNative(customFolderUri, onProgress);
+  } else {
+    let hasNextPage = true;
+    let afterCursor: string | undefined = undefined;
 
-  while (hasNextPage && allAssets.length < 10000) {
-    const mediaPage = await MediaLibrary.getAssetsAsync({
-      mediaType: MediaLibrary.MediaType.audio,
-      first: 500,
-      after: afterCursor,
-    });
-    allAssets = allAssets.concat(mediaPage.assets);
-    hasNextPage = mediaPage.hasNextPage;
-    afterCursor = mediaPage.endCursor;
+    while (hasNextPage && allAssets.length < 10000) {
+      try {
+        const mediaPage = await MediaLibrary.getAssetsAsync({
+          mediaType: MediaLibrary.MediaType.audio,
+          first: 500,
+          after: afterCursor,
+        });
+        allAssets = allAssets.concat(mediaPage.assets);
+        hasNextPage = mediaPage.hasNextPage;
+        afterCursor = mediaPage.endCursor;
+      } catch (mediaErr) {
+        console.warn('[LibraryService] Error paginando MediaLibrary:', mediaErr);
+        break;
+      }
+    }
   }
 
-  // Filtrar exclusivamente archivos de audio válidos por expresión regular o tipo de medio, permitiendo duraciones >= 3s
+  // Filtro tolerante con conversión estricta a minúsculas mediante .toLowerCase() antes de comparar
   const validAssets = allAssets.filter(asset => {
-    const name = asset.filename || asset.uri || '';
-    const isAudioExt = AUDIO_EXTENSIONS_REGEX.test(name) || asset.mediaType === 'audio';
+    const rawName = asset.filename || asset.uri || '';
+    const cleanNameLower = decodeURIComponentSafe(rawName).toLowerCase();
+    const isAudioExt = AUDIO_EXTENSIONS_REGEX.test(cleanNameLower) || ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'dsd', 'dff', 'dsf'].some(ext => cleanNameLower.endsWith(`.${ext}`)) || asset.mediaType === 'audio';
     const hasValidDuration = !asset.duration || asset.duration >= 3;
     return isAudioExt && hasValidDuration;
   });
@@ -325,15 +463,21 @@ export async function scanLocalAudioFiles(
   }
 
   // 4. Detectar y eliminar de SQLite únicamente las pistas que ya no existen ni fueron reubicadas
-  const deletedIds = cachedTracks
-    .filter(t => !activeAssetUris.has(t.id) && !cachedIds.has(t.id))
-    .map(t => t.id);
+  if (!customFolderUri) {
+    const deletedIds = cachedTracks
+      .filter(t => !activeAssetUris.has(t.id) && !cachedIds.has(t.id))
+      .map(t => t.id);
 
-  if (deletedIds.length > 0) {
-    await deleteTracks(deletedIds);
+    if (deletedIds.length > 0) {
+      try {
+        await deleteTracks(deletedIds);
+      } catch (delErr) {
+        console.warn('[LibraryService] Error al limpiar pistas antiguas eliminadas:', delErr);
+      }
+    }
   }
 
-  // 5. Procesamiento transaccional en lotes para las pistas nuevas junto a vinculación de letras
+  // 5. Procesamiento transaccional robusto en lotes con protección anti-crashes para que ningún archivo aborte el proceso
   if (newAssetsToInsert.length > 0) {
     const BATCH_SIZE = 50;
     
@@ -350,7 +494,7 @@ export async function scanLocalAudioFiles(
         try {
           const meta = await extractMetadata(asset.uri, asset.uri);
           
-          let title = meta.title || asset.filename.replace(/\.[^/.]+$/, '').replace(/_/g, ' ');
+          let title = meta.title || decodeURIComponentSafe(asset.filename || '').replace(/\.[^/.]+$/, '').replace(/_/g, ' ');
           let artist = meta.artist || 'Unknown';
           let needsRepair = false;
 
@@ -370,8 +514,8 @@ export async function scanLocalAudioFiles(
             title,
             artist,
             album: meta.album || 'Device Music',
-            duration: Math.round(asset.duration || 0),
-            qualityBadge: getFileQualityBadge(asset.filename || ''),
+            duration: Math.round((meta as any).duration || asset.duration || 0),
+            qualityBadge: getFileQualityBadge(decodeURIComponentSafe(asset.filename || '')),
             artwork: artworkUri,
             artwork_thumb: thumbUri,
             bpm: meta.bpm,
@@ -383,18 +527,29 @@ export async function scanLocalAudioFiles(
             lyrics: linkedLyrics || undefined,
           });
         } catch (err) {
-          console.warn(`[LibraryService] Error procesando archivo ${asset.filename}:`, err);
+          console.warn(`[LibraryService] Error procesando archivo individual ${asset.filename}:`, err);
         }
       }
 
       if (batchTracks.length > 0) {
-        await insertTracks(batchTracks);
+        try {
+          await insertTracks(batchTracks);
+        } catch (batchErr) {
+          console.warn(`[LibraryService] Error en inserción de lote, reintentando pista por pista con tolerancia:`, batchErr);
+          for (const singleTrack of batchTracks) {
+            try {
+              await insertTracks([singleTrack]);
+            } catch (singleErr) {
+              console.warn(`[LibraryService] Pista omitida por incompatibilidad de datos: ${singleTrack.title}`, singleErr);
+            }
+          }
+        }
       }
 
       await new Promise<void>((resolve) => setTimeout(resolve, 15));
     }
   }
 
-  if (onProgress) onProgress('¡Sincronización finalizada!', validAssets.length, validAssets.length);
+  if (onProgress) onProgress('¡Sincronización finalizada con éxito!', validAssets.length, validAssets.length);
   return await getCachedTracks();
 }
