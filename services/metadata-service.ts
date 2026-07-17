@@ -90,82 +90,98 @@ async function saveCoverToDisk(base64Image: string, trackId: string): Promise<st
 
 /**
  * Extrae los metadatos ID3 / Vorbis / FLAC de una pista de audio local.
- * Implementa timeout defensivo para prevenir bloqueos indefinidos si el archivo está corrupto.
+ * Implementa timeout defensivo y captura total de excepciones para prevenir bloqueos o caídas (undefined is not a function).
  */
 export const extractMetadata = async (fileUri: string, trackId?: string): Promise<TrackMetadata> => {
-  const readPromise = new Promise<TrackMetadata>((resolve) => {
-    jsmediatags.read(fileUri, {
-      onSuccess: async (tag) => {
-        try {
-          const metadata: TrackMetadata = {};
-          const tags = tag.tags;
-
-          if (tags.title) metadata.title = tags.title.trim();
-          if (tags.artist) metadata.artist = tags.artist.trim();
-          if (tags.album) metadata.album = tags.album.trim();
-
-          // Extraer carátula y guardar físicamente a disco sin retener Base64 en memoria o DB (Punto 4.1)
-          if (tags.picture && tags.picture.data) {
-            const { data, format } = tags.picture;
-            const safeFormat = format || 'image/jpeg';
-            const base64Data = await byteArrayToBase64NonBlocking(data, safeFormat);
-            if (base64Data) {
-              const targetId = trackId || fileUri.split('/').pop()?.split('?')[0] || fileUri;
-              const savedUri = await saveCoverToDisk(base64Data, targetId);
-              if (savedUri) {
-                metadata.artwork_thumb = savedUri;
-              }
-            }
-          }
-
-          // Parse BPM (TBPM frame en ID3v2 o Vorbis Comment)
-          if (tags.TBPM?.data) {
-            const parsedBpm = parseInt(String(tags.TBPM.data), 10);
-            if (!isNaN(parsedBpm) && parsedBpm > 0 && parsedBpm < 350) {
-              metadata.bpm = parsedBpm;
-            }
-          }
-
-          // Parse Key (TKEY frame en ID3v2 o Vorbis Comment)
-          if (tags.TKEY?.data) {
-            metadata.key = String(tags.TKEY.data).trim();
-          }
-
-          // Parse ReplayGain (TXXX frames en ID3v2 o RVA2/Vorbis)
-          if (tags.TXXX) {
-            const txxxFrames = Array.isArray(tags.TXXX) ? tags.TXXX : [tags.TXXX];
-            txxxFrames.forEach((frame: any) => {
-              const desc = String(frame.user_description || '').toUpperCase();
-              if (desc === 'REPLAYGAIN_TRACK_GAIN' && frame.data) {
-                const val = parseFloat(String(frame.data).replace(/[^0-9.-]+/g, ''));
-                if (!isNaN(val)) metadata.replayGainTrack = val;
-              }
-              if (desc === 'REPLAYGAIN_ALBUM_GAIN' && frame.data) {
-                const val = parseFloat(String(frame.data).replace(/[^0-9.-]+/g, ''));
-                if (!isNaN(val)) metadata.replayGainAlbum = val;
-              }
-            });
-          }
-
-          resolve(metadata);
-        } catch (error) {
-          console.warn(`[MetadataService] Error procesando etiquetas de ${fileUri}:`, error);
+  try {
+    const readPromise = new Promise<TrackMetadata>((resolve) => {
+      try {
+        if (!jsmediatags || typeof jsmediatags.read !== 'function') {
           resolve({});
+          return;
         }
-      },
-      onError: (error) => {
-        console.warn(`[MetadataService] No se pudieron leer metadatos de ${fileUri}:`, error.info || error);
+
+        jsmediatags.read(fileUri, {
+          onSuccess: async (tag) => {
+            try {
+              const metadata: TrackMetadata = {};
+              const tags = tag.tags;
+
+              if (tags.title) metadata.title = tags.title.trim();
+              if (tags.artist) metadata.artist = tags.artist.trim();
+              if (tags.album) metadata.album = tags.album.trim();
+
+              // Extraer carátula y guardar físicamente a disco sin retener Base64 en memoria o DB (Punto 4.1)
+              if (tags.picture && tags.picture.data) {
+                const { data, format } = tags.picture;
+                const safeFormat = format || 'image/jpeg';
+                const base64Data = await byteArrayToBase64NonBlocking(data, safeFormat);
+                if (base64Data) {
+                  const targetId = trackId || fileUri.split('/').pop()?.split('?')[0] || fileUri;
+                  const savedUri = await saveCoverToDisk(base64Data, targetId);
+                  if (savedUri) {
+                    metadata.artwork_thumb = savedUri;
+                  }
+                }
+              }
+
+              // Parse BPM (TBPM frame en ID3v2 o Vorbis Comment)
+              if (tags.TBPM?.data) {
+                const parsedBpm = parseInt(String(tags.TBPM.data), 10);
+                if (!isNaN(parsedBpm) && parsedBpm > 0 && parsedBpm < 350) {
+                  metadata.bpm = parsedBpm;
+                }
+              }
+
+              // Parse Key (TKEY frame en ID3v2 o Vorbis Comment)
+              if (tags.TKEY?.data) {
+                metadata.key = String(tags.TKEY.data).trim();
+              }
+
+              // Parse ReplayGain (TXXX frames en ID3v2 o RVA2/Vorbis)
+              if (tags.TXXX) {
+                const txxxFrames = Array.isArray(tags.TXXX) ? tags.TXXX : [tags.TXXX];
+                txxxFrames.forEach((frame: any) => {
+                  const desc = String(frame.user_description || '').toUpperCase();
+                  if (desc === 'REPLAYGAIN_TRACK_GAIN' && frame.data) {
+                    const val = parseFloat(String(frame.data).replace(/[^0-9.-]+/g, ''));
+                    if (!isNaN(val)) metadata.replayGainTrack = val;
+                  }
+                  if (desc === 'REPLAYGAIN_ALBUM_GAIN' && frame.data) {
+                    const val = parseFloat(String(frame.data).replace(/[^0-9.-]+/g, ''));
+                    if (!isNaN(val)) metadata.replayGainAlbum = val;
+                  }
+                });
+              }
+
+              resolve(metadata);
+            } catch (error) {
+              console.warn(`[MetadataService] Error procesando etiquetas de ${fileUri}:`, error);
+              resolve({});
+            }
+          },
+          onError: (error) => {
+            console.warn(`[MetadataService] No se pudieron leer metadatos de ${fileUri}:`, error.info || error);
+            resolve({});
+          },
+        });
+      } catch (readerError) {
+        // Captura directa de 'undefined is not a function' u otros errores de instanciación en builds nativos Android (.apk)
+        console.warn(`[MetadataService] Error sincrónico en jsmediatags.read para ${fileUri}:`, readerError);
         resolve({});
-      },
+      }
     });
-  });
 
-  // Timeout defensivo de 4000ms: Si jsmediatags se cuelga en un header corrupto, resolvemos vacío para no bloquear la app
-  const timeoutPromise = new Promise<TrackMetadata>((resolve) => {
-    setTimeout(() => {
-      resolve({});
-    }, 4000);
-  });
+    // Timeout defensivo de 3500ms: Si jsmediatags se cuelga en un header corrupto o en IO lento, resolvemos vacío
+    const timeoutPromise = new Promise<TrackMetadata>((resolve) => {
+      setTimeout(() => {
+        resolve({});
+      }, 3500);
+    });
 
-  return Promise.race([readPromise, timeoutPromise]);
+    return await Promise.race([readPromise, timeoutPromise]);
+  } catch (globalErr) {
+    console.warn(`[MetadataService] Excepción global en extractMetadata para ${fileUri}:`, globalErr);
+    return {};
+  }
 };

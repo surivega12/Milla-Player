@@ -828,10 +828,10 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             {isScanning ? (
               <ActivityIndicator size="small" color="#FFFFFF" />
             ) : (
-              <FolderOpen size={15} color="#FFFFFF" />
+              <FolderOpen size={15} color="#38BDF8" />
             )}
             <Text className="text-xs font-bold text-white">
-              {isScanning ? 'Escaneando' : 'Escanear'}
+              {isScanning ? 'Escaneando' : 'Escanear Carpeta'}
             </Text>
           </TouchableOpacity>
         </View>

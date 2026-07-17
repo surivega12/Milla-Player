@@ -360,18 +360,71 @@ export async function readDirectoryRecursivelyNative(
       }
     }
   } catch (dirErr: any) {
-    Alert.alert("Error de Escaneo de Raíz (readDirectory)", String(dirErr?.message || dirErr));
-    throw dirErr;
+    console.warn("[LibraryService] Error leyendo directorio en readDirectoryRecursivelyNative:", dirErr);
   }
   return collectedAssets;
 }
 
+const PERSISTED_FOLDER_FILE = `${FileSystem.documentDirectory}milla_selected_music_folder.txt`;
+
 /**
- * Escanea la biblioteca local en bloques con try-catch global muy estricto y alertas de diagnóstico nativas.
+ * Obtiene la URI de la carpeta de música previamente elegida por el usuario.
+ */
+export async function getPersistedFolderUri(): Promise<string | null> {
+  try {
+    const info = await FileSystem.getInfoAsync(PERSISTED_FOLDER_FILE);
+    if (!info.exists) return null;
+    const content = await FileSystem.readAsStringAsync(PERSISTED_FOLDER_FILE);
+    return content ? content.trim() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Guarda de forma persistente la URI de la carpeta de música seleccionada por el usuario.
+ */
+export async function savePersistedFolderUri(uri: string): Promise<void> {
+  try {
+    await FileSystem.writeAsStringAsync(PERSISTED_FOLDER_FILE, uri);
+  } catch (e) {}
+}
+
+/**
+ * Borra la carpeta persistida para forzar una nueva selección.
+ */
+export async function clearPersistedFolderUri(): Promise<void> {
+  try {
+    await FileSystem.deleteAsync(PERSISTED_FOLDER_FILE, { idempotent: true });
+  } catch (e) {}
+}
+
+/**
+ * Abre OBLIGATORIAMENTE el selector nativo de carpetas de Android (Storage Access Framework)
+ * para que el usuario elija explícitamente qué carpeta desea escanear (ej. Music o Download).
+ */
+export async function selectManualMusicFolder(): Promise<string | null> {
+  if (Platform.OS !== 'android') return null;
+  try {
+    const permissions = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync();
+    if (permissions.granted && permissions.directoryUri) {
+      await savePersistedFolderUri(permissions.directoryUri);
+      return permissions.directoryUri;
+    }
+  } catch (err) {
+    console.warn('[LibraryService] Error al abrir selector nativo SAF:', err);
+  }
+  return null;
+}
+
+/**
+ * Escanea la biblioteca local leyendo la carpeta manual elegida o MediaLibrary.
+ * Fluido, silencioso y seguro contra errores undefined is not a function en metadatos.
  */
 export async function scanLocalAudioFiles(
   onProgress?: (progressText: string, currentCount: number, totalCount?: number) => void,
-  customFolderUri?: string
+  customFolderUri?: string,
+  forceManualSelection?: boolean
 ): Promise<Track[]> {
   try {
     if (Platform.OS === 'web') {
@@ -379,33 +432,44 @@ export async function scanLocalAudioFiles(
     }
 
     const hasPermission = await requestLibraryPermission();
-    if (!hasPermission) {
+    if (!hasPermission && !forceManualSelection) {
       throw new Error('Permisos para acceder a la biblioteca multimedia denegados. Actívalos en Ajustes.');
     }
 
-    // 1. Alerta de Ruta (Format Debugging) al recibir la URI / inicializar
-    Alert.alert(
-      "Ruta Recibida",
-      customFolderUri ? String(customFolderUri) : "MediaLibrary (Dispositivo Global)"
-    );
+    let targetFolderUri: string | undefined = customFolderUri;
 
-    if (onProgress) onProgress('Leyendo archivos de audio compatibles del dispositivo...', 0);
+    // Si se pide obligatoriamente abrir el selector, o estamos en Android y no tenemos carpeta asignada
+    if (forceManualSelection || (Platform.OS === 'android' && !targetFolderUri && customFolderUri === 'SELECT_FOLDER')) {
+      if (onProgress) onProgress('Abriendo selector de carpetas de tu dispositivo...', 0);
+      const selectedUri = await selectManualMusicFolder();
+      if (selectedUri) {
+        targetFolderUri = selectedUri;
+      } else {
+        // Si cancela, revisamos si ya tenía una carpeta anterior guardada en disco
+        const savedUri = await getPersistedFolderUri();
+        if (savedUri) {
+          targetFolderUri = savedUri;
+        } else {
+          return await getCachedTracks();
+        }
+      }
+    } else if (!targetFolderUri) {
+      const savedUri = await getPersistedFolderUri();
+      if (savedUri) {
+        targetFolderUri = savedUri;
+      }
+    }
+
+    if (onProgress) {
+      onProgress(targetFolderUri ? 'Leyendo carpeta seleccionada...' : 'Leyendo audios del dispositivo...', 0);
+    }
 
     const cachedTracks = await getCachedTracks();
     const cachedIds = new Set(cachedTracks.map(t => t.id));
 
-    const dbFingerprintMap = new Map<string, Track>();
-    for (const track of cachedTracks) {
-      const filenameFromUrl = track.url ? track.url.split('/').pop()?.split('?')[0] : track.id.split('/').pop()?.split('?')[0];
-      if (filenameFromUrl) {
-        const fingerprint = getTrackFingerprint(filenameFromUrl, track.duration || 0);
-        dbFingerprintMap.set(fingerprint, track);
-      }
-    }
-
     let allAssets: any[] = [];
-    if (customFolderUri) {
-      allAssets = await readDirectoryRecursivelyNative(customFolderUri, onProgress);
+    if (targetFolderUri) {
+      allAssets = await readDirectoryRecursivelyNative(targetFolderUri, onProgress);
     } else {
       let hasNextPage = true;
       let afterCursor: string | undefined = undefined;
@@ -422,7 +486,6 @@ export async function scanLocalAudioFiles(
           afterCursor = mediaPage.endCursor;
         } catch (mediaErr: any) {
           console.warn('[LibraryService] Error paginando MediaLibrary:', mediaErr);
-          Alert.alert("Error en Paginación MediaLibrary", String(mediaErr?.message || mediaErr));
           break;
         }
       }
@@ -436,46 +499,25 @@ export async function scanLocalAudioFiles(
       return isAudioExt && hasValidDuration;
     });
 
-    // 2. Alerta de Diagnóstico de Archivos en Pantalla
-    Alert.alert(
-      "Diagnóstico de Archivos (Filtro)",
-      `Total devueltos: ${allAssets.length}\nVálidos tras filtro: ${validAssets.length}\nPrimeros 3 nombres: ${allAssets.slice(0, 3).map(a => decodeURIComponentSafe(a.filename || a.uri || 'sin_nombre')).join(', ')}\nExtensiones identificadas: ${allAssets.slice(0, 3).map(a => (a.filename || a.uri || '').split('.').pop()).join(', ')}`
-    );
-
-    if (onProgress) onProgress(`Analizando ${validAssets.length} archivos de audio compatibles...`, 0, validAssets.length);
+    if (onProgress) onProgress(`Sincronizando ${validAssets.length} audios compatibles...`, 0, validAssets.length);
 
     const newAssetsToInsert: any[] = [];
-    const processedFingerprints = new Set<string>();
     const activeAssetUris = new Set<string>();
 
     for (const asset of validAssets) {
       activeAssetUris.add(asset.uri);
-      const assetFingerprint = getTrackFingerprint(asset.filename || '', asset.duration);
-
-      if (processedFingerprints.has(assetFingerprint)) {
-        continue;
-      }
-      processedFingerprints.add(assetFingerprint);
-
-      if (cachedIds.has(asset.uri)) {
-        continue;
-      }
-
-      const existingMatch = dbFingerprintMap.get(assetFingerprint);
-      if (existingMatch) {
-        await updateTrackUri(existingMatch.id, asset.uri);
-        activeAssetUris.add(existingMatch.id);
-        cachedIds.add(asset.uri);
-      } else {
+      if (!cachedIds.has(asset.uri)) {
         newAssetsToInsert.push(asset);
       }
     }
 
-    if (!customFolderUri) {
-      const deletedIds = cachedTracks
-        .filter(t => !activeAssetUris.has(t.id) && !cachedIds.has(t.id))
-        .map(t => t.id);
-
+    if (activeAssetUris.size > 0 && cachedTracks.length > 0) {
+      const deletedIds: string[] = [];
+      for (const track of cachedTracks) {
+        if (!activeAssetUris.has(track.id)) {
+          deletedIds.push(track.id);
+        }
+      }
       if (deletedIds.length > 0) {
         try {
           await deleteTracks(deletedIds);
@@ -494,18 +536,26 @@ export async function scanLocalAudioFiles(
 
         const currentCount = Math.min(i + batchAssets.length, newAssetsToInsert.length);
         if (onProgress) {
-          onProgress(`Escaneando ${currentCount} de ${newAssetsToInsert.length} canciones...`, currentCount, newAssetsToInsert.length);
+          onProgress(`Procesando ${currentCount} de ${newAssetsToInsert.length} canciones...`, currentCount, newAssetsToInsert.length);
         }
 
         for (const asset of batchAssets) {
           try {
-            const meta = await extractMetadata(asset.uri, asset.uri);
+            let meta: any = {};
+            try {
+              meta = await extractMetadata(asset.uri, asset.uri);
+            } catch (metaErr) {
+              meta = {};
+            }
             
-            let title = meta.title || decodeURIComponentSafe(asset.filename || '').replace(/\.[^/.]+$/, '').replace(/_/g, ' ');
-            let artist = meta.artist || 'Unknown';
+            const rawName = asset.filename || asset.uri || '';
+            const cleanName = decodeURIComponentSafe(rawName).split('/').pop()?.split('%2F').pop()?.split('?')[0]?.replace(/\.[^/.]+$/, '').replace(/_/g, ' ') || 'Pista de Audio';
+            
+            let title = meta.title || cleanName;
+            let artist = meta.artist || 'Desconocido';
             let needsRepair = false;
 
-            if (!meta.title || !meta.artist || meta.artist.toLowerCase().includes('unknown')) {
+            if (!meta.title || !meta.artist || meta.artist.toLowerCase().includes('unknown') || artist === 'Desconocido') {
               needsRepair = true;
             }
 
@@ -519,9 +569,9 @@ export async function scanLocalAudioFiles(
               url: asset.uri,
               title,
               artist,
-              album: meta.album || 'Device Music',
-              duration: Math.round((meta as any).duration || asset.duration || 0),
-              qualityBadge: getFileQualityBadge(decodeURIComponentSafe(asset.filename || '')),
+              album: meta.album || 'Carpeta de Música',
+              duration: Math.round((meta as any).duration || asset.duration || 180),
+              qualityBadge: getFileQualityBadge(decodeURIComponentSafe(asset.filename || asset.uri || '')),
               artwork: artworkUri,
               artwork_thumb: thumbUri,
               bpm: meta.bpm,
@@ -532,11 +582,20 @@ export async function scanLocalAudioFiles(
               lyrics_lrc: linkedLyrics || undefined,
               lyrics: linkedLyrics || undefined,
             });
-          } catch (err: any) {
-            console.warn(`[LibraryService] Error procesando archivo individual ${asset.filename}:`, err);
-            if (i === 0 && batchTracks.length === 0) {
-              Alert.alert("Alerta en Pista #1", `No se pudo extraer metadata del archivo: ${asset.filename || asset.uri}\nError: ${String(err?.message || err)}`);
-            }
+          } catch (trackErr: any) {
+            // Si el procesamiento individual falla por cualquier circunstancia, creamos una pista de respaldo
+            const rawName = asset.filename || asset.uri || '';
+            const cleanName = decodeURIComponentSafe(rawName).split('/').pop()?.split('%2F').pop()?.split('?')[0]?.replace(/\.[^/.]+$/, '').replace(/_/g, ' ') || 'Pista de Audio';
+            batchTracks.push({
+              id: asset.uri,
+              url: asset.uri,
+              title: cleanName,
+              artist: 'Desconocido',
+              album: 'Carpeta de Música',
+              duration: Math.round(asset.duration || 180),
+              qualityBadge: getFileQualityBadge(decodeURIComponentSafe(asset.filename || asset.uri || '')),
+              needs_repair: true
+            });
           }
         }
 
@@ -544,38 +603,26 @@ export async function scanLocalAudioFiles(
           try {
             await insertTracks(batchTracks);
           } catch (batchErr: any) {
-            console.warn(`[LibraryService] Error en inserción de lote, reintentando pista por pista con tolerancia:`, batchErr);
+            console.warn(`[LibraryService] Error en inserción de lote, reintentando pista por pista:`, batchErr);
             for (const singleTrack of batchTracks) {
               try {
                 await insertTracks([singleTrack]);
               } catch (singleErr) {
-                console.warn(`[LibraryService] Pista omitida por incompatibilidad de datos: ${singleTrack.title}`, singleErr);
+                console.warn(`[LibraryService] Pista omitida por conflicto SQL: ${singleTrack.title}`, singleErr);
               }
             }
           }
-        } else if (batchAssets.length > 0) {
-          Alert.alert(
-            "Diagnóstico de Lote Vacío",
-            `En el lote ${i}-${i + batchAssets.length}, los ${batchAssets.length} audios produjeron 0 pistas en extractMetadata.`
-          );
         }
 
-        await new Promise<void>((resolve) => setTimeout(resolve, 15));
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
       }
     }
 
-    if (onProgress) onProgress('¡Sincronización finalizada con éxito!', validAssets.length, validAssets.length);
+    if (onProgress) onProgress('¡Biblioteca sincronizada exitosamente!', validAssets.length, validAssets.length);
     
-    const finalTracks = await getCachedTracks();
-    if (validAssets.length > 0 && finalTracks.length === 0) {
-      Alert.alert(
-        "Diagnóstico: SQLite en 0",
-        `Se identificaron ${validAssets.length} archivos compatibles (e intentamos insertar ${newAssetsToInsert.length} nuevos), pero SQLite retornó 0 pistas. Posible error transaccional en la BD.`
-      );
-    }
-    return finalTracks;
+    return await getCachedTracks();
   } catch (error: any) {
-    Alert.alert("Error de Escaneo de Raíz", String(error?.message || error || 'Error desconocido'));
+    console.warn("[LibraryService] Error global en scanLocalAudioFiles:", error);
     throw error;
   }
 }

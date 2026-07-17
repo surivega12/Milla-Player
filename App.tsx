@@ -280,30 +280,30 @@ function MainAppContent() {
     );
   };
 
-  // Escáner nativo y web universal de música local
+  // Escáner nativo y web universal de música local (Selector de carpetas manual)
   const handleScanLocal = async () => {
     setIsScanning(true);
-    setScanProgressText('Iniciando escáner universal...');
+    setScanProgressText('Iniciando selector de carpeta...');
     try {
       const localSongs = await scanLocalAudioFiles((progressText) => {
         setScanProgressText(progressText);
-      });
+      }, undefined, true);
       if (localSongs.length === 0) {
         Alert.alert(
           'Milla Library',
-          'No se encontraron archivos de audio compatibles (.mp3, .flac, .wav, .m4a, .aac, .ogg, .dsd) en tu dispositivo o carpeta seleccionada.'
+          'No se encontraron archivos de audio compatibles en la carpeta seleccionada.'
         );
       } else {
         setTracksList([...localSongs]);
         Alert.alert(
           'Milla Library',
-          `¡Escaneo completo! Se indexaron ${localSongs.length} pistas de audio compatibles y sus letras asociadas en SQLite.`
+          `¡Escaneo completo! Se indexaron ${localSongs.length} pistas de audio en SQLite.`
         );
       }
     } catch (err: any) {
       Alert.alert(
         'Acceso de Permisos',
-        err.message || 'No pudimos acceder a los archivos multimedia compatibles.'
+        err.message || 'No pudimos acceder a la carpeta de audio.'
       );
     } finally {
       setIsScanning(false);
