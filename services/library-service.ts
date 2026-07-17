@@ -1,7 +1,7 @@
 import * as MediaLibrary from 'expo-media-library/legacy';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as ImageManipulator from 'expo-image-manipulator';
-import { Platform } from 'react-native';
+import { Platform, Alert } from 'react-native';
 import { Track } from '../components/PlayerBar';
 import { extractMetadata } from './metadata-service';
 import { getCachedTracks, insertTracks, deleteTracks, updateTrackUri, setWebMockTracks, getWebMockTracks } from './database-service';
@@ -155,7 +155,6 @@ async function findAndLinkLyricsNative(asset: any): Promise<string | null> {
 
 /**
  * Selector de carpetas y archivos híbrido universal para entorno Web (Local Host).
- * Lee todos los formatos compatibles (.mp3, .flac, .wav, .m4a, .aac, .ogg, .dsd) y sus archivos de letras (.lrc/.txt).
  */
 async function scanWebFolderHybrid(
   onProgress?: (progressText: string, count: number, total?: number) => void
@@ -181,7 +180,6 @@ async function scanWebFolderHybrid(
 
         if (onProgress) onProgress(`Analizando ${files.length} archivos de la carpeta...`, 0, files.length);
 
-        // Verificación en minúsculas tolerante
         const audioFiles = files.filter(f => {
           const nameLower = f.name.toLowerCase();
           return AUDIO_EXTENSIONS_REGEX.test(nameLower) || ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'dsd', 'dff', 'dsf'].some(ext => nameLower.endsWith(`.${ext}`)) || f.type.startsWith('audio/');
@@ -218,7 +216,6 @@ async function scanWebFolderHybrid(
           const fileUrl = URL.createObjectURL(file);
           const badge = getFileQualityBadge(file.name);
 
-          // Extract metadata via jsmediatags
           const tags: any = await new Promise((resolveTags) => {
             jsmediatags.read(file, {
               onSuccess: function(tag: any) {
@@ -250,7 +247,7 @@ async function scanWebFolderHybrid(
             title: trackTitle,
             artist: trackArtist,
             album: trackAlbum,
-            duration: Math.round((file.size || 5000000) / 32000), // Estimación orientativa para web local
+            duration: Math.round((file.size || 5000000) / 32000),
             qualityBadge: badge,
             lyrics_lrc: lyricsText,
             lyrics: lyricsText,
@@ -279,8 +276,7 @@ async function scanWebFolderHybrid(
 }
 
 /**
- * Escáner recursivo universal de carpetas (Storage Access Framework o file://) con bloques try-catch
- * por cada subcarpeta e ítem para ignorar carpetas vacías o protegidas sin abortar el proceso.
+ * Escáner recursivo universal de carpetas con try-catch y alertas de diagnóstico.
  */
 export async function readDirectoryRecursivelyNative(
   dirUri: string,
@@ -288,13 +284,17 @@ export async function readDirectoryRecursivelyNative(
   collectedAssets: any[] = [],
   visitedDirs: Set<string> = new Set()
 ): Promise<any[]> {
-  if (!dirUri) return collectedAssets;
-  
-  const normalizedDir = normalizeNativeUri(dirUri);
-  if (visitedDirs.has(normalizedDir)) return collectedAssets;
-  visitedDirs.add(normalizedDir);
-
   try {
+    if (!dirUri) return collectedAssets;
+    
+    const normalizedDir = normalizeNativeUri(dirUri);
+    if (visitedDirs.has(normalizedDir)) return collectedAssets;
+    visitedDirs.add(normalizedDir);
+
+    if (visitedDirs.size === 1) {
+      Alert.alert("Ruta Recibida (Recursiva)", String(dirUri));
+    }
+
     if (normalizedDir.startsWith('content://')) {
       const items = await FileSystem.StorageAccessFramework.readDirectoryAsync(normalizedDir);
       for (let i = 0; i < items.length; i++) {
@@ -314,7 +314,7 @@ export async function readDirectoryRecursivelyNative(
               uri: itemUri,
               filename: decodeURIComponentSafe(rawFilename),
               mediaType: 'audio',
-              duration: 180, // Duración inicial orientativa hasta extracción por metadata-service
+              duration: 180,
               size: (info as any)?.size || 0
             });
           } else {
@@ -324,8 +324,7 @@ export async function readDirectoryRecursivelyNative(
             }
           }
         } catch (subErr) {
-          // Bloque try-catch interno para cada subcarpeta o ítem del sistema: ignorar con gracia
-          console.warn(`[LibraryService] Ignorando subcarpeta/ítem protegido con gracia: ${itemUri}`, subErr);
+          console.warn(`[LibraryService] Ignorando ítem/subcarpeta protegido: ${itemUri}`, subErr);
         }
       }
     } else {
@@ -356,200 +355,227 @@ export async function readDirectoryRecursivelyNative(
             }
           }
         } catch (subErr) {
-          console.warn(`[LibraryService] Ignorando subcarpeta/ítem protegido con gracia: ${item}`, subErr);
+          console.warn(`[LibraryService] Ignorando ítem protegido: ${item}`, subErr);
         }
       }
     }
-  } catch (dirErr) {
-    console.warn(`[LibraryService] No se pudo leer directorio o carpeta protegida ${dirUri}:`, dirErr);
+  } catch (dirErr: any) {
+    Alert.alert("Error de Escaneo de Raíz (readDirectory)", String(dirErr?.message || dirErr));
+    throw dirErr;
   }
   return collectedAssets;
 }
 
 /**
- * Escanea la biblioteca de audio local con procesamiento por lotes, soporte universal y
- * tolerancia completa de extensiones (minúsculas/mayúsculas) y carpetas protegidas.
+ * Escanea la biblioteca local en bloques con try-catch global muy estricto y alertas de diagnóstico nativas.
  */
 export async function scanLocalAudioFiles(
   onProgress?: (progressText: string, currentCount: number, totalCount?: number) => void,
   customFolderUri?: string
 ): Promise<Track[]> {
-  if (Platform.OS === 'web') {
-    return scanWebFolderHybrid(onProgress);
-  }
-
-  const hasPermission = await requestLibraryPermission();
-  if (!hasPermission) {
-    throw new Error('Permisos para acceder a la biblioteca multimedia denegados. Actívalos en Ajustes.');
-  }
-
-  if (onProgress) onProgress('Leyendo archivos de audio compatibles del dispositivo...', 0);
-
-  // 1. Obtener canciones ya en caché desde SQLite
-  const cachedTracks = await getCachedTracks();
-  const cachedIds = new Set(cachedTracks.map(t => t.id));
-
-  const dbFingerprintMap = new Map<string, Track>();
-  for (const track of cachedTracks) {
-    const filenameFromUrl = track.url ? track.url.split('/').pop()?.split('?')[0] : track.id.split('/').pop()?.split('?')[0];
-    if (filenameFromUrl) {
-      const fingerprint = getTrackFingerprint(filenameFromUrl, track.duration || 0);
-      dbFingerprintMap.set(fingerprint, track);
+  try {
+    if (Platform.OS === 'web') {
+      return await scanWebFolderHybrid(onProgress);
     }
-  }
 
-  // 2. Paginación nativa para traer todos los audios del dispositivo sin desbordar memoria o desde carpeta personalizada
-  let allAssets: any[] = [];
-  if (customFolderUri) {
-    allAssets = await readDirectoryRecursivelyNative(customFolderUri, onProgress);
-  } else {
-    let hasNextPage = true;
-    let afterCursor: string | undefined = undefined;
+    const hasPermission = await requestLibraryPermission();
+    if (!hasPermission) {
+      throw new Error('Permisos para acceder a la biblioteca multimedia denegados. Actívalos en Ajustes.');
+    }
 
-    while (hasNextPage && allAssets.length < 10000) {
-      try {
-        const mediaPage = await MediaLibrary.getAssetsAsync({
-          mediaType: MediaLibrary.MediaType.audio,
-          first: 500,
-          after: afterCursor,
-        });
-        allAssets = allAssets.concat(mediaPage.assets);
-        hasNextPage = mediaPage.hasNextPage;
-        afterCursor = mediaPage.endCursor;
-      } catch (mediaErr) {
-        console.warn('[LibraryService] Error paginando MediaLibrary:', mediaErr);
-        break;
+    // 1. Alerta de Ruta (Format Debugging) al recibir la URI / inicializar
+    Alert.alert(
+      "Ruta Recibida",
+      customFolderUri ? String(customFolderUri) : "MediaLibrary (Dispositivo Global)"
+    );
+
+    if (onProgress) onProgress('Leyendo archivos de audio compatibles del dispositivo...', 0);
+
+    const cachedTracks = await getCachedTracks();
+    const cachedIds = new Set(cachedTracks.map(t => t.id));
+
+    const dbFingerprintMap = new Map<string, Track>();
+    for (const track of cachedTracks) {
+      const filenameFromUrl = track.url ? track.url.split('/').pop()?.split('?')[0] : track.id.split('/').pop()?.split('?')[0];
+      if (filenameFromUrl) {
+        const fingerprint = getTrackFingerprint(filenameFromUrl, track.duration || 0);
+        dbFingerprintMap.set(fingerprint, track);
       }
     }
-  }
 
-  // Filtro tolerante con conversión estricta a minúsculas mediante .toLowerCase() antes de comparar
-  const validAssets = allAssets.filter(asset => {
-    const rawName = asset.filename || asset.uri || '';
-    const cleanNameLower = decodeURIComponentSafe(rawName).toLowerCase();
-    const isAudioExt = AUDIO_EXTENSIONS_REGEX.test(cleanNameLower) || ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'dsd', 'dff', 'dsf'].some(ext => cleanNameLower.endsWith(`.${ext}`)) || asset.mediaType === 'audio';
-    const hasValidDuration = !asset.duration || asset.duration >= 3;
-    return isAudioExt && hasValidDuration;
-  });
-
-  if (onProgress) onProgress(`Analizando ${validAssets.length} archivos de audio compatibles...`, 0, validAssets.length);
-
-  // 3. Verificación defensiva anti-duplicados y detección de archivos movidos de carpeta
-  const newAssetsToInsert: any[] = [];
-  const processedFingerprints = new Set<string>();
-  const activeAssetUris = new Set<string>();
-
-  for (const asset of validAssets) {
-    activeAssetUris.add(asset.uri);
-    const assetFingerprint = getTrackFingerprint(asset.filename || '', asset.duration);
-
-    if (processedFingerprints.has(assetFingerprint)) {
-      continue;
-    }
-    processedFingerprints.add(assetFingerprint);
-
-    if (cachedIds.has(asset.uri)) {
-      continue;
-    }
-
-    const existingMatch = dbFingerprintMap.get(assetFingerprint);
-    if (existingMatch) {
-      await updateTrackUri(existingMatch.id, asset.uri);
-      activeAssetUris.add(existingMatch.id);
-      cachedIds.add(asset.uri);
+    let allAssets: any[] = [];
+    if (customFolderUri) {
+      allAssets = await readDirectoryRecursivelyNative(customFolderUri, onProgress);
     } else {
-      newAssetsToInsert.push(asset);
-    }
-  }
+      let hasNextPage = true;
+      let afterCursor: string | undefined = undefined;
 
-  // 4. Detectar y eliminar de SQLite únicamente las pistas que ya no existen ni fueron reubicadas
-  if (!customFolderUri) {
-    const deletedIds = cachedTracks
-      .filter(t => !activeAssetUris.has(t.id) && !cachedIds.has(t.id))
-      .map(t => t.id);
-
-    if (deletedIds.length > 0) {
-      try {
-        await deleteTracks(deletedIds);
-      } catch (delErr) {
-        console.warn('[LibraryService] Error al limpiar pistas antiguas eliminadas:', delErr);
-      }
-    }
-  }
-
-  // 5. Procesamiento transaccional robusto en lotes con protección anti-crashes para que ningún archivo aborte el proceso
-  if (newAssetsToInsert.length > 0) {
-    const BATCH_SIZE = 50;
-    
-    for (let i = 0; i < newAssetsToInsert.length; i += BATCH_SIZE) {
-      const batchAssets = newAssetsToInsert.slice(i, i + BATCH_SIZE);
-      const batchTracks: Track[] = [];
-
-      const currentCount = Math.min(i + batchAssets.length, newAssetsToInsert.length);
-      if (onProgress) {
-        onProgress(`Escaneando ${currentCount} de ${newAssetsToInsert.length} canciones...`, currentCount, newAssetsToInsert.length);
-      }
-
-      for (const asset of batchAssets) {
+      while (hasNextPage && allAssets.length < 10000) {
         try {
-          const meta = await extractMetadata(asset.uri, asset.uri);
-          
-          let title = meta.title || decodeURIComponentSafe(asset.filename || '').replace(/\.[^/.]+$/, '').replace(/_/g, ' ');
-          let artist = meta.artist || 'Unknown';
-          let needsRepair = false;
-
-          if (!meta.title || !meta.artist || meta.artist.toLowerCase().includes('unknown')) {
-            needsRepair = true;
-          }
-
-          let artworkUri = meta.artwork_thumb;
-          let thumbUri = meta.artwork_thumb;
-
-          // Buscar letras .lrc o .txt exactamente con el mismo nombre
-          const linkedLyrics = await findAndLinkLyricsNative(asset);
-
-          batchTracks.push({
-            id: asset.uri,
-            url: asset.uri,
-            title,
-            artist,
-            album: meta.album || 'Device Music',
-            duration: Math.round((meta as any).duration || asset.duration || 0),
-            qualityBadge: getFileQualityBadge(decodeURIComponentSafe(asset.filename || '')),
-            artwork: artworkUri,
-            artwork_thumb: thumbUri,
-            bpm: meta.bpm,
-            key: meta.key,
-            replayGainTrack: meta.replayGainTrack,
-            replayGainAlbum: meta.replayGainAlbum,
-            needs_repair: needsRepair as any,
-            lyrics_lrc: linkedLyrics || undefined,
-            lyrics: linkedLyrics || undefined,
+          const mediaPage = await MediaLibrary.getAssetsAsync({
+            mediaType: MediaLibrary.MediaType.audio,
+            first: 500,
+            after: afterCursor,
           });
-        } catch (err) {
-          console.warn(`[LibraryService] Error procesando archivo individual ${asset.filename}:`, err);
+          allAssets = allAssets.concat(mediaPage.assets);
+          hasNextPage = mediaPage.hasNextPage;
+          afterCursor = mediaPage.endCursor;
+        } catch (mediaErr: any) {
+          console.warn('[LibraryService] Error paginando MediaLibrary:', mediaErr);
+          Alert.alert("Error en Paginación MediaLibrary", String(mediaErr?.message || mediaErr));
+          break;
         }
       }
+    }
 
-      if (batchTracks.length > 0) {
+    const validAssets = allAssets.filter(asset => {
+      const rawName = asset.filename || asset.uri || '';
+      const cleanNameLower = decodeURIComponentSafe(rawName).toLowerCase();
+      const isAudioExt = AUDIO_EXTENSIONS_REGEX.test(cleanNameLower) || ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'dsd', 'dff', 'dsf'].some(ext => cleanNameLower.endsWith(`.${ext}`)) || asset.mediaType === 'audio';
+      const hasValidDuration = !asset.duration || asset.duration >= 3;
+      return isAudioExt && hasValidDuration;
+    });
+
+    // 2. Alerta de Diagnóstico de Archivos en Pantalla
+    Alert.alert(
+      "Diagnóstico de Archivos (Filtro)",
+      `Total devueltos: ${allAssets.length}\nVálidos tras filtro: ${validAssets.length}\nPrimeros 3 nombres: ${allAssets.slice(0, 3).map(a => decodeURIComponentSafe(a.filename || a.uri || 'sin_nombre')).join(', ')}\nExtensiones identificadas: ${allAssets.slice(0, 3).map(a => (a.filename || a.uri || '').split('.').pop()).join(', ')}`
+    );
+
+    if (onProgress) onProgress(`Analizando ${validAssets.length} archivos de audio compatibles...`, 0, validAssets.length);
+
+    const newAssetsToInsert: any[] = [];
+    const processedFingerprints = new Set<string>();
+    const activeAssetUris = new Set<string>();
+
+    for (const asset of validAssets) {
+      activeAssetUris.add(asset.uri);
+      const assetFingerprint = getTrackFingerprint(asset.filename || '', asset.duration);
+
+      if (processedFingerprints.has(assetFingerprint)) {
+        continue;
+      }
+      processedFingerprints.add(assetFingerprint);
+
+      if (cachedIds.has(asset.uri)) {
+        continue;
+      }
+
+      const existingMatch = dbFingerprintMap.get(assetFingerprint);
+      if (existingMatch) {
+        await updateTrackUri(existingMatch.id, asset.uri);
+        activeAssetUris.add(existingMatch.id);
+        cachedIds.add(asset.uri);
+      } else {
+        newAssetsToInsert.push(asset);
+      }
+    }
+
+    if (!customFolderUri) {
+      const deletedIds = cachedTracks
+        .filter(t => !activeAssetUris.has(t.id) && !cachedIds.has(t.id))
+        .map(t => t.id);
+
+      if (deletedIds.length > 0) {
         try {
-          await insertTracks(batchTracks);
-        } catch (batchErr) {
-          console.warn(`[LibraryService] Error en inserción de lote, reintentando pista por pista con tolerancia:`, batchErr);
-          for (const singleTrack of batchTracks) {
-            try {
-              await insertTracks([singleTrack]);
-            } catch (singleErr) {
-              console.warn(`[LibraryService] Pista omitida por incompatibilidad de datos: ${singleTrack.title}`, singleErr);
+          await deleteTracks(deletedIds);
+        } catch (delErr) {
+          console.warn('[LibraryService] Error al limpiar pistas antiguas eliminadas:', delErr);
+        }
+      }
+    }
+
+    if (newAssetsToInsert.length > 0) {
+      const BATCH_SIZE = 50;
+      
+      for (let i = 0; i < newAssetsToInsert.length; i += BATCH_SIZE) {
+        const batchAssets = newAssetsToInsert.slice(i, i + BATCH_SIZE);
+        const batchTracks: Track[] = [];
+
+        const currentCount = Math.min(i + batchAssets.length, newAssetsToInsert.length);
+        if (onProgress) {
+          onProgress(`Escaneando ${currentCount} de ${newAssetsToInsert.length} canciones...`, currentCount, newAssetsToInsert.length);
+        }
+
+        for (const asset of batchAssets) {
+          try {
+            const meta = await extractMetadata(asset.uri, asset.uri);
+            
+            let title = meta.title || decodeURIComponentSafe(asset.filename || '').replace(/\.[^/.]+$/, '').replace(/_/g, ' ');
+            let artist = meta.artist || 'Unknown';
+            let needsRepair = false;
+
+            if (!meta.title || !meta.artist || meta.artist.toLowerCase().includes('unknown')) {
+              needsRepair = true;
+            }
+
+            let artworkUri = meta.artwork_thumb;
+            let thumbUri = meta.artwork_thumb;
+
+            const linkedLyrics = await findAndLinkLyricsNative(asset);
+
+            batchTracks.push({
+              id: asset.uri,
+              url: asset.uri,
+              title,
+              artist,
+              album: meta.album || 'Device Music',
+              duration: Math.round((meta as any).duration || asset.duration || 0),
+              qualityBadge: getFileQualityBadge(decodeURIComponentSafe(asset.filename || '')),
+              artwork: artworkUri,
+              artwork_thumb: thumbUri,
+              bpm: meta.bpm,
+              key: meta.key,
+              replayGainTrack: meta.replayGainTrack,
+              replayGainAlbum: meta.replayGainAlbum,
+              needs_repair: needsRepair as any,
+              lyrics_lrc: linkedLyrics || undefined,
+              lyrics: linkedLyrics || undefined,
+            });
+          } catch (err: any) {
+            console.warn(`[LibraryService] Error procesando archivo individual ${asset.filename}:`, err);
+            if (i === 0 && batchTracks.length === 0) {
+              Alert.alert("Alerta en Pista #1", `No se pudo extraer metadata del archivo: ${asset.filename || asset.uri}\nError: ${String(err?.message || err)}`);
             }
           }
         }
+
+        if (batchTracks.length > 0) {
+          try {
+            await insertTracks(batchTracks);
+          } catch (batchErr: any) {
+            console.warn(`[LibraryService] Error en inserción de lote, reintentando pista por pista con tolerancia:`, batchErr);
+            for (const singleTrack of batchTracks) {
+              try {
+                await insertTracks([singleTrack]);
+              } catch (singleErr) {
+                console.warn(`[LibraryService] Pista omitida por incompatibilidad de datos: ${singleTrack.title}`, singleErr);
+              }
+            }
+          }
+        } else if (batchAssets.length > 0) {
+          Alert.alert(
+            "Diagnóstico de Lote Vacío",
+            `En el lote ${i}-${i + batchAssets.length}, los ${batchAssets.length} audios produjeron 0 pistas en extractMetadata.`
+          );
+        }
+
+        await new Promise<void>((resolve) => setTimeout(resolve, 15));
       }
-
-      await new Promise<void>((resolve) => setTimeout(resolve, 15));
     }
-  }
 
-  if (onProgress) onProgress('¡Sincronización finalizada con éxito!', validAssets.length, validAssets.length);
-  return await getCachedTracks();
+    if (onProgress) onProgress('¡Sincronización finalizada con éxito!', validAssets.length, validAssets.length);
+    
+    const finalTracks = await getCachedTracks();
+    if (validAssets.length > 0 && finalTracks.length === 0) {
+      Alert.alert(
+        "Diagnóstico: SQLite en 0",
+        `Se identificaron ${validAssets.length} archivos compatibles (e intentamos insertar ${newAssetsToInsert.length} nuevos), pero SQLite retornó 0 pistas. Posible error transaccional en la BD.`
+      );
+    }
+    return finalTracks;
+  } catch (error: any) {
+    Alert.alert("Error de Escaneo de Raíz", String(error?.message || error || 'Error desconocido'));
+    throw error;
+  }
 }
