@@ -12,11 +12,11 @@ jobs:
       - name: 🟢 Configurar Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.13
           cache: 'npm'
 
       - name: 📦 Instalar dependencias
-        run: npm install
+        run: npm ci
 
       - name: 🔍 Verificar Tipos (TypeScript)
         run: node --stack-size=10000 ./node_modules/typescript/bin/tsc --noEmit --skipLibCheck

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { StatusBar } from 'expo-status-bar';
-import { View, StyleSheet, Alert, ActivityIndicator, TouchableOpacity, Text, Platform } from 'react-native';
+import { View, StyleSheet, Alert, ActivityIndicator, TouchableOpacity, Text, Platform, BackHandler } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as MediaLibrary from 'expo-media-library/legacy';
 import './global.css';
@@ -24,9 +24,9 @@ import TrackPlayer, {
   useActiveTrack,
   State,
 } from 'react-native-track-player';
-import { setupPlayer, playPlaylist } from './services/audio-service';
+import { configureAutoMixQueue, setupPlayer, playPlaylist } from './services/audio-service';
 import { isUnresolvedSafUri, scanDeviceAudioFiles, scanManualMusicFolder, sanitizeTrackUriForPlayback } from './services/library-service';
-import { getCachedTracks, initializeVertexDatabase, insertTracks } from './services/database-service';
+import { getAutoMixSettings, getCachedTracks, initializeVertexDatabase, insertTracks } from './services/database-service';
 import { searchRecording } from './services/musicbrainz-service';
 import { VertexQueueProvider, useVertexQueue, VertexTrack } from './services/queue-service';
 import {
@@ -45,6 +45,9 @@ function MainAppContent() {
   const [activeTab, setActiveTab] = useState<string>('home');
   const [isLiked, setIsLiked] = useState<boolean>(false);
   const [isSmartDJActive, setIsSmartDJActive] = useState<boolean>(false);
+  const [lyricsRequestNonce, setLyricsRequestNonce] = useState<number>(0);
+  const [queueRequestNonce, setQueueRequestNonce] = useState<number>(0);
+  const tabHistoryRef = useRef<string[]>(['home']);
 
   // Estados de control de arranque y permisos (PASO 1)
   const [isDbReady, setIsDbReady] = useState<boolean>(false);
@@ -93,10 +96,10 @@ function MainAppContent() {
           setHasPermissions(true);
         } else {
           console.log('Verificando permisos multimedia al iniciar App.tsx...');
-          const { status, canAskAgain } = await MediaLibrary.getPermissionsAsync();
+          const { status, canAskAgain } = await MediaLibrary.getPermissionsAsync(false, ['audio']);
           let granted = status === 'granted';
           if (!granted && (status === 'undetermined' || canAskAgain)) {
-            const { status: newStatus } = await MediaLibrary.requestPermissionsAsync();
+            const { status: newStatus } = await MediaLibrary.requestPermissionsAsync(false, ['audio']);
             granted = newStatus === 'granted';
           }
           setHasPermissions(granted);
@@ -115,6 +118,9 @@ function MainAppContent() {
         }
         setTracksList(playableCachedTracks);
         setCatalog(playableCachedTracks as VertexTrack[]);
+        const autoMixSettings = await getAutoMixSettings();
+        await queueManager.syncSettings();
+        setIsSmartDJActive(autoMixSettings.enabled);
         await setupPlayer();
         await syncDownloads(playableCachedTracks);
         setIsDbReady(true);
@@ -147,12 +153,12 @@ function MainAppContent() {
   // Función para sincronizar la lista de descargas y tamaño de carpeta
   const syncDownloads = async (sourceTracks: Track[] = tracksList) => {
     const downloaded = new Set<string>();
-    for (const track of sourceTracks) {
-      const localUri = await getLocalTrackUri(track.id);
-      if (localUri) {
-        downloaded.add(track.id);
-      }
-    }
+    const localResults = await Promise.all(
+      sourceTracks.map(async (track) => ({ id: track.id, uri: await getLocalTrackUri(track.id) }))
+    );
+    localResults.forEach(({ id, uri }) => {
+      if (uri) downloaded.add(id);
+    });
     setDownloadedIds(downloaded);
     const sizeStr = await getDownloadsFolderSize();
     setCacheSize(sizeStr);
@@ -161,24 +167,57 @@ function MainAppContent() {
   // 2. Sincronizar track activo de TrackPlayer con la UI y la Cola Inteligente
   useEffect(() => {
     if (activeTrack) {
+      const activeId = String(activeTrack.id);
       const foundInCatalog = tracksList.find(
-        (t) => t.id === activeTrack.id || activeTrack.id.endsWith(`${t.id}.flac`)
+        (t) => t.id === activeId || activeId.endsWith(`${t.id}.flac`)
       );
 
       const updatedTrack: Track = {
-        id: activeTrack.id,
+        ...(foundInCatalog || ({} as Track)),
+        id: activeId,
+        url: foundInCatalog?.url || String(activeTrack.url || ''),
         title: activeTrack.title || foundInCatalog?.title || 'Unknown Track',
         artist: activeTrack.artist || foundInCatalog?.artist || 'Unknown Artist',
         album: activeTrack.album || foundInCatalog?.album || 'Unknown Album',
-        duration: activeTrack.duration,
-        artwork: activeTrack.artwork || foundInCatalog?.artwork || undefined,
-        qualityBadge: activeTrack.id.startsWith('file:') || activeTrack.url?.startsWith('file:') ? 'Local FLAC' : 'Hi-Res Lossless',
+        duration: activeTrack.duration || foundInCatalog?.duration,
+        artwork: foundInCatalog?.artwork_thumb || activeTrack.artwork || foundInCatalog?.artwork,
+        artwork_thumb: foundInCatalog?.artwork_thumb,
+        qualityBadge: foundInCatalog?.qualityBadge || (activeId.startsWith('file:') || String(activeTrack.url || '').startsWith('file:') ? 'Local Audio' : 'Hi-Res Lossless'),
       };
 
       setCurrentTrack(updatedTrack);
       setQueueCurrentTrack(updatedTrack as VertexTrack);
     }
   }, [activeTrack, tracksList]);
+
+  const handleSelectTab = (nextTab: string) => {
+    if (nextTab === activeTab) return;
+    const history = tabHistoryRef.current;
+    if (history[history.length - 1] !== nextTab) history.push(nextTab);
+    setActiveTab(nextTab);
+  };
+
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (isNowPlayingOpen) {
+        setIsNowPlayingOpen(false);
+        return true;
+      }
+      if (isSidebarOpen) {
+        setIsSidebarOpen(false);
+        return true;
+      }
+      const history = tabHistoryRef.current;
+      if (history.length > 1) {
+        history.pop();
+        setActiveTab(history[history.length - 1] || 'home');
+        return true;
+      }
+      return activeTab !== 'home';
+    });
+    return () => subscription.remove();
+  }, [activeTab, isNowPlayingOpen, isSidebarOpen]);
 
   const colorRequestIdRef = useRef<number>(0);
 
@@ -209,21 +248,20 @@ function MainAppContent() {
 
   // Controles de Reproducción delegados a TrackPlayer
   const handleSelectTrack = async (track: Track) => {
-    if (queueManager && typeof queueManager.setSessionAutoMixForced === 'function') {
-      queueManager.setSessionAutoMixForced(false);
+    try {
+      queueManager.setSessionAutoMixForced(isSmartDJActive);
+      const updatedList = await Promise.all(
+        tracksList.map(async (item) => {
+          const localUri = await getLocalTrackUri(item.id);
+          return localUri ? { ...item, url: localUri } : item;
+        })
+      );
+      const index = tracksList.findIndex((item) => item.id === track.id);
+      await playPlaylist(updatedList, index >= 0 ? index : 0);
+    } catch (error: any) {
+      console.error('No se pudo iniciar la pista seleccionada:', error);
+      Alert.alert('No se pudo reproducir', error?.message || 'La ruta local de esta pista ya no es accesible. Vuelve a escanearla.');
     }
-    const updatedList = await Promise.all(
-      tracksList.map(async (t) => {
-        const localUri = await getLocalTrackUri(t.id);
-        if (localUri) {
-          return { ...t, url: localUri };
-        }
-        return t;
-      })
-    );
-
-    const index = tracksList.findIndex((t) => t.id === track.id);
-    await playPlaylist(updatedList, index >= 0 ? index : 0);
   };
 
   const handlePlayPause = async () => {
@@ -283,8 +321,15 @@ function MainAppContent() {
   };
 
   // Activar / Desactivar Radio Inteligente MillaSmartDJ
-  const handleToggleSmartDJ = () => {
+  const handleToggleSmartDJ = async () => {
     const nextState = !isSmartDJActive;
+    try {
+      await configureAutoMixQueue(tracksList, currentTrack, nextState);
+    } catch (error) {
+      console.error('No se pudo reconfigurar Auto Mix:', error);
+      Alert.alert('Auto Mix', 'No se pudo reconfigurar la cola actual. Intenta de nuevo al cambiar de pista.');
+      return;
+    }
     setIsSmartDJActive(nextState);
     Alert.alert(
       'MillaSmartDJ™ AI',
@@ -365,18 +410,12 @@ function MainAppContent() {
             }
           }
 
-          const estimatedBpm = (track as any).bpm || Math.floor(95 + Math.random() * 40);
-          const camelotKeys = ['1A', '2A', '4A', '5A', '7A', '8A', '9A', '11A', '1B', '4B', '6B', '8B', '10B'];
-          const estimatedKey = (track as any).key || camelotKeys[Math.floor(Math.random() * camelotKeys.length)];
-
           const fixedTrack: Track = {
             ...track,
             title: updatedTitle,
             artist: updatedArtist,
             album: updatedAlbum,
-            bpm: estimatedBpm,
-            key: estimatedKey,
-            needs_repair: false as any,
+            needs_repair: !updatedTitle || !updatedArtist || updatedArtist.toLowerCase().includes('unknown'),
           };
 
           updatedTracksList[i] = fixedTrack;
@@ -488,7 +527,7 @@ function MainAppContent() {
           </Text>
           <TouchableOpacity
             onPress={async () => {
-              const { status } = await MediaLibrary.requestPermissionsAsync();
+              const { status } = await MediaLibrary.requestPermissionsAsync(false, ['audio']);
               if (status === 'granted') {
                 setHasPermissions(true);
               } else {
@@ -576,6 +615,7 @@ function MainAppContent() {
             onDownloadTrack={handleDownloadTrack}
             onOptimize={handleOptimizeLibrary}
             isOptimizing={isOptimizing}
+            onNavigateToArtists={() => handleSelectTab('artistas')}
           />
         )}
 
@@ -592,6 +632,17 @@ function MainAppContent() {
           onPrev={handlePrev}
           onToggleLike={() => setIsLiked(!isLiked)}
           onPressBar={() => setIsNowPlayingOpen(true)}
+          onOpenLyrics={() => {
+            setIsNowPlayingOpen(true);
+            setLyricsRequestNonce((value) => value + 1);
+          }}
+          onOpenQueue={() => {
+            setIsNowPlayingOpen(true);
+            setQueueRequestNonce((value) => value + 1);
+          }}
+          onAddToPlaylist={() => Alert.alert('Lista de reproduccion', 'Usa el menu de opciones de la pista para elegir o crear una lista.')}
+          onSleepTimer={() => setIsNowPlayingOpen(true)}
+          onCast={() => Alert.alert('Transmitir', 'No se encontro un dispositivo de audio disponible en la red.')}
         />
         )}
       </View>
@@ -601,7 +652,7 @@ function MainAppContent() {
         isOpen={isSidebarOpen}
         onClose={() => setIsSidebarOpen(false)}
         activeTab={activeTab}
-        onSelectTab={setActiveTab}
+        onSelectTab={handleSelectTab}
         currentTheme={currentTheme}
       />
 
@@ -620,6 +671,8 @@ function MainAppContent() {
         onToggleLike={() => setIsLiked(!isLiked)}
         onToggleSmartDJ={handleToggleSmartDJ}
         isSmartDJActive={isSmartDJActive}
+        lyricsRequestNonce={lyricsRequestNonce}
+        queueRequestNonce={queueRequestNonce}
       />
     </View>
   );

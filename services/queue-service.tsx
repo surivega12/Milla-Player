@@ -1,6 +1,5 @@
 import React, { createContext, useContext, useState, useRef, useEffect, ReactNode } from 'react';
 import { Track } from '../components/PlayerBar';
-import { getCompatibleKeys } from './smart-dj-service';
 import { getAutoMixSettings } from './database-service';
 
 export interface VertexTrack extends Track {
@@ -24,6 +23,8 @@ export class VertexQueueManager {
   private isAutoMixEnabled: boolean = true;
   private bpmTolerance: number = 3;
   private isSessionAutoMixForced: boolean = false;
+  private harmonicMode: 'strict' | 'energy' | 'free' = 'strict';
+  private transitionSeconds: number = 1.2;
 
   constructor(catalog: VertexTrack[] = []) {
     this.fullCatalog = catalog;
@@ -49,6 +50,10 @@ export class VertexQueueManager {
       const settings = await getAutoMixSettings();
       this.isAutoMixEnabled = settings.enabled;
       this.bpmTolerance = settings.bpm_tolerance;
+      this.harmonicMode = settings.harmonic_mode;
+      this.transitionSeconds = settings.crossfade_seconds > 0
+        ? Math.min(Math.max(settings.crossfade_seconds, 0.8), 3)
+        : 1.2;
       if (!this.isAutoMixEnabled && !this.isSessionAutoMixForced) {
         this.autoMixQueue = [];
       } else {
@@ -68,6 +73,14 @@ export class VertexQueueManager {
       this.recalculateAutoMix();
     }
     this.notifyChange();
+  }
+
+  public isAutoMixActive(): boolean {
+    return this.isAutoMixEnabled || this.isSessionAutoMixForced;
+  }
+
+  public getTransitionSeconds(): number {
+    return this.transitionSeconds;
   }
 
   public setCatalog(catalog: VertexTrack[]): void {
@@ -128,16 +141,30 @@ export class VertexQueueManager {
 
   public setCurrentTrack(track: VertexTrack | null): void {
     if (this.currentTrack && this.currentTrack.id !== track?.id) {
-      this.history.push(this.currentTrack);
+      if (this.history[this.history.length - 1]?.id !== this.currentTrack.id) {
+        this.history.push(this.currentTrack);
+        this.history = this.history.slice(-100);
+      }
     }
     this.currentTrack = track;
+    if (track) {
+      this.priorityQueue = this.priorityQueue.filter((item) => item.id !== track.id);
+      this.autoMixQueue = this.autoMixQueue.filter((item) => item.id !== track.id);
+    }
     this.recalculateAutoMix();
     this.notifyChange();
   }
 
+  public peekNextTrack(): VertexTrack | null {
+    if (this.priorityQueue.length > 0) return this.priorityQueue[0];
+    if (this.isAutoMixActive() && this.autoMixQueue.length > 0) return this.autoMixQueue[0];
+    return null;
+  }
+
   public getNextTrack(): VertexTrack | null {
-    if (this.currentTrack) {
+    if (this.currentTrack && this.history[this.history.length - 1]?.id !== this.currentTrack.id) {
       this.history.push(this.currentTrack);
+      this.history = this.history.slice(-100);
     }
 
     // Capa 1: Cola de prioridad / selección manual
@@ -150,7 +177,7 @@ export class VertexQueueManager {
 
     // Capa 2: Cola calculada dinámicamente por IA / AutoMix (Rueda de Camelot & BPM)
     // Solo si el Auto Mix está activado en Configuración o forzado temporalmente en la sesión de escucha
-    if ((this.isAutoMixEnabled || this.isSessionAutoMixForced) && this.autoMixQueue.length > 0) {
+    if (this.isAutoMixActive() && this.autoMixQueue.length > 0) {
       this.currentTrack = this.autoMixQueue.shift()!;
       this.recalculateAutoMix();
       this.notifyChange();
@@ -168,8 +195,7 @@ export class VertexQueueManager {
     }
 
     const referenceTrack = 
-      this.priorityQueue[this.priorityQueue.length - 1] || 
-      this.currentTrack || 
+      this.currentTrack ||
       this.history[this.history.length - 1];
 
     if (!referenceTrack || this.fullCatalog.length === 0) return;
@@ -194,27 +220,25 @@ export class VertexQueueManager {
   private calculateMixScore(current: VertexTrack, next: VertexTrack): number {
     let score = 100;
 
-    const currentBpm = current.bpm || 100;
-    const nextBpm = next.bpm || 100;
-    const bpmDiff = Math.abs(currentBpm - nextBpm);
-    const bpmDiffPercent = bpmDiff / currentBpm;
-    
-    if (bpmDiff > this.bpmTolerance) {
-      score -= 60;
-    } else if (bpmDiffPercent > 0.05) {
-      score -= 30;
-    } else {
-      score += (this.bpmTolerance - bpmDiff) * 10;
+    const currentBpm = current.bpm;
+    const nextBpm = next.bpm;
+    if (currentBpm && nextBpm) {
+      const bpmDiff = Math.abs(currentBpm - nextBpm);
+      const bpmDiffPercent = bpmDiff / currentBpm;
+      if (bpmDiff > this.bpmTolerance) score -= 60;
+      else if (bpmDiffPercent > 0.05) score -= 30;
+      else score += (this.bpmTolerance - bpmDiff) * 10;
     }
 
-    const currentKey = current.camelotKey || current.key || '';
-    const nextKey = next.camelotKey || next.key || '';
-    const harmonicDistance = this.getCamelotDistance(currentKey, nextKey);
-    
-    if (harmonicDistance === 0) score += 40;
-    else if (harmonicDistance === 1) score += 25;
-    else if (harmonicDistance === 2) score += 5;
-    else score -= 40;
+    const currentKey = current.camelotKey || current.camelot_key || current.key || '';
+    const nextKey = next.camelotKey || next.camelot_key || next.key || '';
+    if (currentKey && nextKey && this.harmonicMode !== 'free') {
+      const harmonicDistance = this.getCamelotDistance(currentKey, nextKey);
+      if (harmonicDistance === 0) score += 40;
+      else if (harmonicDistance === 1) score += this.harmonicMode === 'energy' ? 35 : 25;
+      else if (harmonicDistance === 2) score += this.harmonicMode === 'energy' ? 15 : 5;
+      else score -= this.harmonicMode === 'strict' ? 40 : 15;
+    }
 
     if (current.hasVocalOutro && next.hasVocalIntro) {
       score -= 60;

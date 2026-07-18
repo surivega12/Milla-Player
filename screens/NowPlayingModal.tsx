@@ -37,7 +37,7 @@ import {
   Maximize,
 } from 'lucide-react-native';
 import Slider from '@react-native-community/slider';
-import TrackPlayer, { RepeatMode } from 'react-native-track-player';
+import TrackPlayer, { RepeatMode, useProgress } from 'react-native-track-player';
 import { getThemeColors } from '../utils/theme-colors';
 import { parseLrc, getDemoLyrics, LyricLine } from '../utils/lyrics';
 import { Track } from '../components/PlayerBar';
@@ -63,6 +63,8 @@ interface NowPlayingModalProps {
   onToggleLike?: () => void;
   onToggleSmartDJ?: () => void;
   isSmartDJActive?: boolean;
+  lyricsRequestNonce?: number;
+  queueRequestNonce?: number;
 }
 
 const LyricLineRow = ({
@@ -116,6 +118,8 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
   onToggleLike,
   onToggleSmartDJ,
   isSmartDJActive = false,
+  lyricsRequestNonce = 0,
+  queueRequestNonce = 0,
 }) => {
   const colors = getThemeColors(currentTheme);
   const [showLyrics, setShowLyrics] = useState<boolean>(false);
@@ -129,22 +133,25 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
   const [volumeBarWidth, setVolumeBarWidth] = useState<number>(200);
   const [isShuffleActive, setIsShuffleActive] = useState<boolean>(false);
   const [repeatMode, setRepeatMode] = useState<RepeatMode>(RepeatMode.Off);
+  const [seekDraft, setSeekDraft] = useState<number | null>(null);
   const flatListRef = useRef<FlatList<LyricLine>>(null);
+  const nativeProgress = useProgress(500);
 
   // Lógica de Doble Capa (Double-Layer Reanimated Crossfade)
   const [prevArtwork, setPrevArtwork] = useState<string | null>(null);
-  const [currentArtwork, setCurrentArtwork] = useState<string | null>(track?.artwork || null);
+  const displayArtwork = track?.artwork_thumb || track?.artwork || null;
+  const [currentArtwork, setCurrentArtwork] = useState<string | null>(displayArtwork);
   const crossfadeProgress = useSharedValue(1);
 
   useEffect(() => {
-    if (track?.artwork !== currentArtwork) {
+    if (displayArtwork !== currentArtwork) {
       setPrevArtwork(currentArtwork);
-      setCurrentArtwork(track?.artwork || null);
+      setCurrentArtwork(displayArtwork);
       crossfadeProgress.value = 0;
       // Transición ultra fluida de 800ms
       crossfadeProgress.value = withTiming(1, { duration: 800 });
     }
-  }, [track?.artwork, currentArtwork]);
+  }, [displayArtwork, currentArtwork]);
 
   const currentArtworkStyle = useAnimatedStyle(() => {
     return {
@@ -164,8 +171,13 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
     };
   });
 
-  const totalSeconds = track?.duration || 225;
-  const currentSeconds = Math.floor(totalSeconds * progress);
+  const totalSeconds = nativeProgress.duration > 0
+    ? nativeProgress.duration
+    : Math.max(track?.duration || 0, 1);
+  const currentSeconds = nativeProgress.duration > 0
+    ? nativeProgress.position
+    : totalSeconds * progress;
+  const displayedSeconds = seekDraft ?? currentSeconds;
 
   const lyricLines = useMemo(() => {
     if (!track) return [];
@@ -176,14 +188,14 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
     if (lyricLines.length === 0) return -1;
     let activeIndex = -1;
     for (let i = 0; i < lyricLines.length; i++) {
-      if (currentSeconds >= lyricLines[i].time) {
+      if (displayedSeconds >= lyricLines[i].time) {
         activeIndex = i;
       } else {
         break;
       }
     }
     return activeIndex;
-  }, [lyricLines, currentSeconds]);
+  }, [lyricLines, displayedSeconds]);
 
   useEffect(() => {
     if (showLyrics && activeLineIndex >= 0 && flatListRef.current) {
@@ -195,10 +207,6 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
     }
   }, [activeLineIndex, showLyrics]);
 
-  if (!isOpen || !track) {
-    return null;
-  }
-
   const formatTime = (secs: number) => {
     const mins = Math.floor(secs / 60);
     const remSecs = secs % 60;
@@ -206,10 +214,13 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
   };
 
   const handleSeekToLyric = async (time: number) => {
+    const safeTime = Math.max(0, Math.min(time, totalSeconds));
     try {
-      await TrackPlayer.seekTo(time);
+      await TrackPlayer.seekTo(safeTime);
     } catch (e) {
       console.error('Error seeking to lyric time:', e);
+    } finally {
+      setSeekDraft(null);
     }
   };
 
@@ -326,6 +337,18 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
     return () => clearInterval(interval);
   }, [sleepTimerActive, sleepRemainingSeconds]);
 
+  useEffect(() => {
+    if (isOpen && lyricsRequestNonce > 0) setShowLyricsModal(true);
+  }, [isOpen, lyricsRequestNonce]);
+
+  useEffect(() => {
+    if (isOpen && queueRequestNonce > 0) setShowQueueModal(true);
+  }, [isOpen, queueRequestNonce]);
+
+  useEffect(() => {
+    setSeekDraft(null);
+  }, [track?.id]);
+
   const handleSleepTimerPress = () => {
     if (!sleepTimerActive) {
       setSleepTimerActive(true);
@@ -343,6 +366,10 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
       Alert.alert('Sleep Timer', 'Sleep Timer desactivado.');
     }
   };
+
+  if (!isOpen || !track) {
+    return null;
+  }
 
   return (
     <View style={StyleSheet.absoluteFill} className="z-50 bg-black">
@@ -432,7 +459,9 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
               style={{ width: '100%', height: 26 }}
               minimumValue={0}
               maximumValue={totalSeconds}
-              value={currentSeconds}
+              value={displayedSeconds}
+              onSlidingStart={() => setSeekDraft(currentSeconds)}
+              onValueChange={setSeekDraft}
               onSlidingComplete={(val) => handleSeekToLyric(val)}
               minimumTrackTintColor="#bae6fd"
               maximumTrackTintColor="rgba(255,255,255,0.15)"
@@ -440,10 +469,10 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
             />
             <View className="flex-row justify-between items-center px-1 -mt-1">
               <Text className="text-xs font-semibold text-neutral-400">
-                {formatTime(currentSeconds)}
+                {formatTime(Math.floor(displayedSeconds))}
               </Text>
               <Text className="text-xs font-semibold text-neutral-400">
-                {formatTime(totalSeconds)}
+                {formatTime(Math.floor(totalSeconds))}
               </Text>
             </View>
           </View>

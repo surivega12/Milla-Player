@@ -139,16 +139,6 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   const updateAndSaveAutoMixSetting = async (partial: Partial<AutoMixSettings>) => {
     let updated = { ...autoMixSettings, ...partial };
 
-    // Si el usuario enciende Auto Mix manualmente, apagar/cero en crossfade y cross-out
-    if (partial.enabled === true) {
-      updated.crossfade_seconds = 0;
-      updated.cross_out_enabled = false;
-    }
-    // Si el usuario mueve el crossfade a > 0s o enciende cross-out, apagar Auto Mix
-    else if ((partial.crossfade_seconds !== undefined && partial.crossfade_seconds > 0) || partial.cross_out_enabled === true) {
-      updated.enabled = false;
-    }
-
     setAutoMixSettings(updated);
     await saveAutoMixSettings(updated);
     if (typeof globalVertexQueueManager?.syncSettings === 'function') {
@@ -495,14 +485,12 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                 </View>
               </View>
 
-              <View style={[styles.optionCard, { flexDirection: 'column', alignItems: 'flex-start', opacity: autoMixSettings.enabled ? 0.6 : 1 }]}>
+              <View style={[styles.optionCard, { flexDirection: 'column', alignItems: 'flex-start' }]}>
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between', width: '100%' }}>
                   <View style={{ flex: 1 }}>
                     <Text style={styles.optionTitle}>Duración del Crossfade</Text>
                     <Text style={styles.optionDesc}>
-                      {autoMixSettings.enabled
-                        ? 'Desactivado (Auto Mix inteligente al mando)'
-                        : 'Tiempo de superposición entre la pista actual y la siguiente'}
+                      Tiempo de desvanecimiento entre la pista actual y la siguiente
                     </Text>
                   </View>
                   <Text style={{ color: '#B43C12', fontSize: 16, fontWeight: '800', marginLeft: 12 }}>
@@ -524,13 +512,11 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                 </View>
               </View>
 
-              <View style={[styles.optionCard, { opacity: autoMixSettings.enabled ? 0.6 : 1 }]}>
+              <View style={styles.optionCard}>
                 <View style={{ flex: 1 }}>
                   <Text style={styles.optionTitle}>Salida Inteligente (Cross-out)</Text>
                   <Text style={styles.optionDesc}>
-                    {autoMixSettings.enabled
-                      ? 'Desactivado por exclusión mutua de Auto Mix'
-                      : 'Desvanece automáticamente el outro instrumental o final vocal'}
+                    Desvanece automaticamente el outro instrumental o final vocal
                   </Text>
                 </View>
                 <Switch

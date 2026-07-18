@@ -1,5 +1,6 @@
 import jsmediatags from 'jsmediatags';
 import * as FileSystem from 'expo-file-system/legacy';
+import { getAudioMetadata } from '@missingcore/audio-metadata';
 
 export interface TrackMetadata {
   title?: string;
@@ -88,12 +89,46 @@ async function saveCoverToDisk(base64Image: string, trackId: string): Promise<st
   }
 }
 
+async function extractMetadataByChunks(fileUri: string, trackId?: string): Promise<TrackMetadata> {
+  const cleanUri = fileUri.split('?')[0].toLowerCase();
+  if (!cleanUri.endsWith('.flac') && !cleanUri.endsWith('.mp3') && !cleanUri.endsWith('.m4a') && !cleanUri.endsWith('.mp4')) {
+    return {};
+  }
+
+  const response = await Promise.race([
+    getAudioMetadata(fileUri, ['name', 'artist', 'album', 'artwork'] as const),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
+  ]);
+  if (!response) return {};
+
+  const tags = response.metadata;
+  const metadata: TrackMetadata = {
+    title: tags.name?.trim(),
+    artist: tags.artist?.trim(),
+    album: tags.album?.trim(),
+  };
+  if (tags.artwork) {
+    const targetId = trackId || fileUri.split('/').pop()?.split('?')[0] || fileUri;
+    metadata.artwork_thumb = (await saveCoverToDisk(tags.artwork, targetId)) || undefined;
+  }
+  return metadata;
+}
+
 /**
  * Extrae los metadatos ID3 / Vorbis / FLAC de una pista de audio local.
  * Implementa timeout defensivo y captura total de excepciones para prevenir bloqueos o caídas (undefined is not a function).
  */
 export const extractMetadata = async (fileUri: string, trackId?: string): Promise<TrackMetadata> => {
   try {
+    try {
+      const chunkedMetadata = await extractMetadataByChunks(fileUri, trackId);
+      if (chunkedMetadata.title || chunkedMetadata.artist || chunkedMetadata.album || chunkedMetadata.artwork_thumb) {
+        return chunkedMetadata;
+      }
+    } catch (chunkedError) {
+      console.warn(`[MetadataService] Lector por bloques no disponible para ${fileUri}:`, chunkedError);
+    }
+
     const readPromise = new Promise<TrackMetadata>((resolve) => {
       try {
         if (!jsmediatags || typeof jsmediatags.read !== 'function') {

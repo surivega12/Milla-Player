@@ -8,10 +8,10 @@ import jsmediatags from 'jsmediatags';
 
 export async function requestLibraryPermission(): Promise<boolean> {
   if (Platform.OS === 'web') return true;
-  const { status, canAskAgain } = await MediaLibrary.getPermissionsAsync();
+  const { status, canAskAgain } = await MediaLibrary.getPermissionsAsync(false, ['audio']);
   if (status === 'granted') return true;
   if (status === 'undetermined' || canAskAgain) {
-    const { status: newStatus } = await MediaLibrary.requestPermissionsAsync();
+    const { status: newStatus } = await MediaLibrary.requestPermissionsAsync(false, ['audio']);
     return newStatus === 'granted';
   }
   return false;
@@ -617,7 +617,7 @@ export async function scanLocalAudioFiles(
       newAssetsToInsert.push(asset);
     }
 
-    if (activeAssetUris.size > 0 && cachedTracks.length > 0) {
+    if (!targetFolderUri && activeAssetUris.size > 0 && cachedTracks.length > 0) {
       const deletedIds: string[] = [];
       for (const track of cachedTracks) {
         if (!activeAssetUris.has(track.id) && !migratedIds.has(track.id)) {

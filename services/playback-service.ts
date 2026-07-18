@@ -2,6 +2,31 @@ import TrackPlayer, { Event } from 'react-native-track-player';
 import { Platform } from 'react-native';
 import { globalVertexQueueManager, VertexTrack } from './queue-service';
 import { getCachedTracks, updateTrackPlayCount } from './database-service';
+import { isUnresolvedSafUri, sanitizeTrackUriForPlayback } from './library-service';
+
+let fadingOutTrackId: string | null = null;
+let shouldFadeInNextTrack = false;
+let fadeRestoreVolume = 1;
+
+function toNativeTrackPayload(track: VertexTrack) {
+  const url = sanitizeTrackUriForPlayback(track.url || track.id);
+  if (!url || isUnresolvedSafUri(url)) {
+    throw new Error(`La ruta de "${track.title}" no es reproducible.`);
+  }
+  return {
+    id: track.id,
+    url,
+    title: track.title || 'Desconocido',
+    artist: track.artist || 'Unknown Artist',
+    album: track.album || 'Milla Hi-Res Library',
+    artwork: track.artwork_thumb || track.artwork,
+    duration: track.duration || 0,
+    bpm: track.bpm,
+    key: track.camelot_key || track.key,
+    replayGainTrack: track.replayGainTrack,
+    replayGainAlbum: track.replayGainAlbum,
+  };
+}
 
 // Target de volumen interno si usamos ReplayGain (ej. -14 LUFS estándar, ajustamos en base al gain)
 // Como TrackPlayer.setVolume() va de 0 a 1, mapearemos los decibelios.
@@ -52,19 +77,7 @@ async function injectAndPlayTrackFromMaster(nextTrack: VertexTrack): Promise<voi
     }
 
     // Preparamos el payload compatible con TrackPlayer asegurando thumbnail local (artwork_thumb)
-    const trackPayload = {
-      id: nextTrack.id,
-      url: nextTrack.url || nextTrack.id,
-      title: nextTrack.title || 'Desconocido',
-      artist: nextTrack.artist || 'Unknown Artist',
-      album: nextTrack.album || 'Milla Hi-Res Library',
-      artwork: (nextTrack as any).artwork_thumb || nextTrack.artwork,
-      duration: nextTrack.duration || 0,
-      bpm: nextTrack.bpm,
-      key: nextTrack.key,
-      replayGainTrack: nextTrack.replayGainTrack,
-      replayGainAlbum: nextTrack.replayGainAlbum,
-    };
+    const trackPayload = toNativeTrackPayload(nextTrack);
 
     if (currentActiveIndex !== undefined && currentActiveIndex >= 0) {
       // Inyectar en índice actual + 1 para mantener la consistencia del reproductor
@@ -80,6 +93,31 @@ async function injectAndPlayTrackFromMaster(nextTrack: VertexTrack): Promise<voi
   } catch (err) {
     console.error('[PlaybackService] Error al inyectar pista desde VertexQueueManager:', err);
   }
+}
+
+async function prepareNextAutoMixTrack(): Promise<void> {
+  if (!globalVertexQueueManager.isAutoMixActive()) return;
+  const nextTrack = globalVertexQueueManager.peekNextTrack();
+  if (!nextTrack) return;
+
+  const activeIndex = await TrackPlayer.getActiveTrackIndex();
+  if (activeIndex === undefined || activeIndex === null || activeIndex < 0) return;
+  const queue = await TrackPlayer.getQueue();
+  const nativeNext = queue[activeIndex + 1];
+
+  if (nativeNext?.id === nextTrack.id) {
+    const extraIndexes = queue
+      .map((_, index) => index)
+      .filter((index) => index > activeIndex + 1);
+    if (extraIndexes.length > 0) await TrackPlayer.remove(extraIndexes);
+    return;
+  }
+
+  const upcomingIndexes = queue
+    .map((_, index) => index)
+    .filter((index) => index > activeIndex);
+  if (upcomingIndexes.length > 0) await TrackPlayer.remove(upcomingIndexes);
+  await TrackPlayer.add([toNativeTrackPayload(nextTrack)], activeIndex + 1);
 }
 
 /**
@@ -130,6 +168,31 @@ export async function playbackService() {
     TrackPlayer.seekTo(event.position).catch((err) => console.log('Error en RemoteSeek:', err));
   });
 
+  TrackPlayer.addEventListener(Event.PlaybackProgressUpdated, async (event) => {
+    if (!globalVertexQueueManager.isAutoMixActive() || !event.duration) return;
+    const remaining = event.duration - event.position;
+    const transitionSeconds = globalVertexQueueManager.getTransitionSeconds();
+    if (fadingOutTrackId && remaining > transitionSeconds + 0.5) {
+      await TrackPlayer.setVolume(fadeRestoreVolume).catch(() => {});
+      fadingOutTrackId = null;
+      shouldFadeInNextTrack = false;
+    }
+    if (remaining <= 0 || remaining > transitionSeconds) return;
+
+    const activeTrack = await TrackPlayer.getActiveTrack().catch(() => undefined);
+    const activeId = activeTrack?.id ? String(activeTrack.id) : null;
+    if (!activeId || fadingOutTrackId === activeId) return;
+
+    fadingOutTrackId = activeId;
+    shouldFadeInNextTrack = true;
+    const startVolume = await TrackPlayer.getVolume().catch(() => 1);
+    fadeRestoreVolume = startVolume;
+    for (let step = 3; step >= 0; step--) {
+      await TrackPlayer.setVolume(Math.max(0.02, startVolume * (step / 4))).catch(() => {});
+      await new Promise<void>((resolve) => setTimeout(resolve, 90));
+    }
+  });
+
   // Interceptar fin de cola del reproductor nativo e inyectar automáticamente desde AutoMix (Capa 2)
   TrackPlayer.addEventListener(Event.PlaybackQueueEnded, async (event) => {
     try {
@@ -152,9 +215,22 @@ export async function playbackService() {
     if (event.track) {
       // 1. Aplicamos la normalización de volumen audiófila (ReplayGain LUFS) en tiempo real
       await applyReplayGain(event.track);
+      if (shouldFadeInNextTrack) {
+        shouldFadeInNextTrack = false;
+        fadingOutTrackId = null;
+        const targetVolume = await TrackPlayer.getVolume().catch(() => 1);
+        await TrackPlayer.setVolume(0.02).catch(() => {});
+        for (let step = 1; step <= 5; step++) {
+          await TrackPlayer.setVolume(Math.max(0.02, targetVolume * (step / 5))).catch(() => {});
+          await new Promise<void>((resolve) => setTimeout(resolve, 80));
+        }
+      }
       
       // 2. Reportamos al Maestro (VertexQueueManager) cuál es la pista que realmente está sonando
       globalVertexQueueManager.setCurrentTrack(event.track as any);
+      prepareNextAutoMixTrack().catch((error) => {
+        console.warn('[PlaybackService] No se pudo preparar la siguiente mezcla:', error);
+      });
       if (event.track.id) {
         updateTrackPlayCount(event.track.id).catch(() => {});
       }

@@ -8,6 +8,7 @@ import {
   Dimensions,
   ActivityIndicator,
   RefreshControl,
+  InteractionManager,
 } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import Animated, { useSharedValue, useAnimatedScrollHandler } from 'react-native-reanimated';
@@ -54,6 +55,34 @@ function getArtworkFallback(track: Track) {
     initial: label.charAt(0).toLocaleUpperCase() || 'M',
   };
 }
+
+const TrackArtwork = React.memo(({ track }: { track: Track }) => {
+  const imageUrl = track.artwork_thumb || track.artwork;
+  const fallback = getArtworkFallback(track);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => setFailed(false), [imageUrl]);
+
+  if (imageUrl && !failed) {
+    return (
+      <Image
+        source={{ uri: imageUrl }}
+        style={StyleSheet.absoluteFill}
+        resizeMode="cover"
+        onError={() => setFailed(true)}
+      />
+    );
+  }
+
+  return (
+    <View style={[styles.artworkFallback, { backgroundColor: fallback.background }]}>
+      <View style={[styles.artworkBlob, { backgroundColor: fallback.accent }]} />
+      <View style={[styles.artworkHighlight, { backgroundColor: fallback.highlight }]} />
+      <Music2 size={19} color={fallback.text} style={styles.artworkIcon} />
+      <Text style={[styles.artworkInitial, { color: fallback.text }]}>{fallback.initial}</Text>
+    </View>
+  );
+});
 
 export type SortOption = 'title' | 'artist' | 'album' | 'quality';
 
@@ -126,11 +155,12 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
   }, [propTracks]);
 
   useEffect(() => {
-    if (propTracks.length > 0) {
-      setLocalTracks(propTracks);
-    }
-    loadTracksFromDatabase(localTracks.length === 0);
-  }, [propTracks, loadTracksFromDatabase]);
+    if (propTracks.length > 0) setLocalTracks(propTracks);
+  }, [propTracks]);
+
+  useEffect(() => {
+    if (propTracks.length === 0) loadTracksFromDatabase(true);
+  }, []);
 
   // Las carátulas se hidratan con la ruta local ya saneada y se guardan nuevamente en SQLite.
   // Un conjunto de solicitudes evita releer el mismo archivo durante actualizaciones de la lista.
@@ -145,8 +175,7 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
     candidates.forEach((track) => artworkRequestsRef.current.add(track.id));
 
     const hydrateArtwork = async () => {
-      const enrichedTracks: Track[] = [];
-      const BATCH_SIZE = 3;
+      const BATCH_SIZE = 2;
 
       for (let index = 0; index < candidates.length && !cancelled; index += BATCH_SIZE) {
         const batch = candidates.slice(index, index + BATCH_SIZE);
@@ -163,8 +192,6 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
             };
           } catch {
             return null;
-          } finally {
-            artworkRequestsRef.current.delete(track.id);
           }
         }));
 
@@ -172,21 +199,21 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
           (track): track is NonNullable<typeof track> => track !== null
         );
         if (foundArtwork.length > 0 && !cancelled) {
-          enrichedTracks.push(...foundArtwork);
           const byId = new Map(foundArtwork.map((track) => [track.id, track]));
           setLocalTracks((current) => current.map((track) => byId.get(track.id) || track));
+          await insertTracks(foundArtwork).catch((error) => {
+            console.warn('No se pudieron persistir las caratulas extraidas:', error);
+          });
         }
       }
 
-      if (enrichedTracks.length > 0 && !cancelled) {
-        await insertTracks(enrichedTracks).catch((error) => {
-          console.warn('No se pudieron persistir las carátulas extraídas:', error);
-        });
-      }
     };
 
-    hydrateArtwork();
-    return () => { cancelled = true; };
+    const interaction = InteractionManager.runAfterInteractions(hydrateArtwork);
+    return () => {
+      cancelled = true;
+      interaction.cancel();
+    };
   }, [localTracks]);
 
   const handleRefresh = async () => {
@@ -275,9 +302,6 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
         (item.qualityBadge || '').toUpperCase().includes('24-BIT');
 
       // Si existe miniatura ultraligera en SQLite, usarla; si no, usar artwork o fallback
-      const imageUrl = item.artwork_thumb || item.artwork;
-      const fallback = getArtworkFallback(item);
-
       return (
         <TouchableOpacity
           onPress={() => handleCardPress(item)}
@@ -291,20 +315,7 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
         >
           {/* Carátula (Extremo Izquierdo) */}
           <View style={{ width: 53, height: 53 }} className="rounded-md overflow-hidden bg-neutral-900 border border-white/5 mr-3 relative">
-            {imageUrl ? (
-              <Image
-                source={{ uri: imageUrl }}
-                style={StyleSheet.absoluteFill}
-                resizeMode="cover"
-              />
-            ) : (
-              <View style={[styles.artworkFallback, { backgroundColor: fallback.background }]}>
-                <View style={[styles.artworkBlob, { backgroundColor: fallback.accent }]} />
-                <View style={[styles.artworkHighlight, { backgroundColor: fallback.highlight }]} />
-                <Music2 size={19} color={fallback.text} style={styles.artworkIcon} />
-                <Text style={[styles.artworkInitial, { color: fallback.text }]}>{fallback.initial}</Text>
-              </View>
-            )}
+            <TrackArtwork track={item} />
             {/* Indicador de Reproducción Actual */}
             {isCurrent && (
               <View className="absolute inset-0 bg-black/50 items-center justify-center">

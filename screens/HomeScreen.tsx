@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -11,6 +11,7 @@ import {
   Modal,
   Alert,
   Platform,
+  BackHandler,
 } from 'react-native';
 import Animated, { useSharedValue, useAnimatedScrollHandler } from 'react-native-reanimated';
 import { AnimatedHeader } from '../components/AnimatedHeader';
@@ -63,6 +64,7 @@ interface HomeScreenProps {
   onDownloadTrack: (track: Track) => void;
   onOptimize?: () => void;
   isOptimizing?: boolean;
+  onNavigateToArtists?: () => void;
 }
 
 type SubScreenType = 'home' | 'history' | 'recent' | 'top_played';
@@ -83,10 +85,27 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   onDownloadTrack,
   onOptimize,
   isOptimizing = false,
+  onNavigateToArtists,
 }) => {
   const [activeSubScreen, setActiveSubScreen] = useState<SubScreenType>('home');
   const [isEmotionModalOpen, setIsEmotionModalOpen] = useState<boolean>(false);
   const { setCatalog, setSessionAutoMixForced } = useVertexQueue();
+
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (isEmotionModalOpen) {
+        setIsEmotionModalOpen(false);
+        return true;
+      }
+      if (activeSubScreen !== 'home') {
+        setActiveSubScreen('home');
+        return true;
+      }
+      return true;
+    });
+    return () => subscription.remove();
+  }, [activeSubScreen, isEmotionModalOpen]);
 
   const startSessionPlaylist = async (playlistTracks: Track[], titleAlert: string) => {
     if (!playlistTracks || playlistTracks.length === 0) {
@@ -206,9 +225,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             <ArrowLeft size={24} color="#FFFFFF" />
           </TouchableOpacity>
           <Text className="text-xl font-extrabold text-white tracking-tight">{getSubScreenTitle()}</Text>
-          <TouchableOpacity hitSlop={{ top: 15, bottom: 15, left: 15, right: 15 }} className="p-1.5">
-            <MoreVertical size={22} color="#ef4444" />
-          </TouchableOpacity>
+          <View className="w-9" />
         </View>
 
         {/* Dos Botones de Acción Rápida Minimalistas (Reproducir translúcido y Aleatorio en contraste) */}
@@ -303,9 +320,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                       </Text>
                     </View>
                   </View>
-                  <TouchableOpacity hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} className="p-2">
-                    <MoreVertical size={18} color="#9CA3AF" />
-                  </TouchableOpacity>
+                  <View className="w-9" />
                 </TouchableOpacity>
               );
             })
@@ -713,7 +728,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         <View className="mb-8">
           <View className="flex-row items-center justify-between px-5 mb-3.5">
             <Text className="text-xl font-bold text-white tracking-tight">Novedades</Text>
-            <TouchableOpacity hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} className="p-1">
+            <TouchableOpacity onPress={() => setActiveSubScreen('recent')} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} className="p-1">
               <ArrowRight size={20} color="#9CA3AF" />
             </TouchableOpacity>
           </View>
@@ -770,7 +785,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         <View className="mb-8">
           <View className="flex-row items-center justify-between px-5 mb-3.5">
             <Text className="text-xl font-bold text-white tracking-tight">Top artists</Text>
-            <TouchableOpacity hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} className="p-1">
+            <TouchableOpacity onPress={onNavigateToArtists} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }} className="p-1">
               <ArrowRight size={20} color="#9CA3AF" />
             </TouchableOpacity>
           </View>
@@ -783,7 +798,14 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             {topArtists.map((artistName, idx) => {
               const artistImg = getArtistArtwork(artistName);
               return (
-                <TouchableOpacity key={`${artistName}-${idx}`} className="items-center w-24 active:opacity-85">
+                <TouchableOpacity
+                  key={`${artistName}-${idx}`}
+                  onPress={() => {
+                    const artistTrack = tracks.find((track) => track.artist === artistName);
+                    if (artistTrack) onSelectTrack(artistTrack);
+                  }}
+                  className="items-center w-24 active:opacity-85"
+                >
                   <View className="w-24 h-24 rounded-full bg-neutral-900 border border-white/15 overflow-hidden mb-2 justify-center items-center shadow-md">
                     {artistImg ? (
                       <Image source={{ uri: artistImg }} className="w-full h-full" resizeMode="cover" />

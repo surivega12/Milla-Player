@@ -62,8 +62,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   const handleFooterPress = (item: NavItem) => {
     if (item.id === 'github') {
-      Linking.openURL('https://github.com/TU-USUARIO/vertex-stationarr').catch(() => {
-        Alert.alert('GitHub Repository', 'https://github.com/TU-USUARIO/vertex-stationarr');
+      Linking.openURL('https://github.com/surivega12/Milla-Player').catch(() => {
+        Alert.alert('GitHub Repository', 'https://github.com/surivega12/Milla-Player');
       });
     } else {
       Alert.alert(item.label, `${item.label} feature integration coming soon.`);

@@ -31,6 +31,20 @@ const DEFAULT_BACKEND_URL = 'http://10.0.2.2:8000'; // IP estándar para emulado
  * Comprueba si el dispositivo está conectado a una red Wi-Fi activa.
  * Si detecta conexión móvil (cellular) y no se forzó lo contrario, aborta para no gastar megas del usuario.
  */
+const CONFIGURED_BACKEND_URL = (
+  process.env.EXPO_PUBLIC_MILLA_API_URL || (__DEV__ ? DEFAULT_BACKEND_URL : '')
+).replace(/\/$/, '');
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number = 8000): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export const checkCanSync = async (forceOnCellular: boolean = false): Promise<{ canSync: boolean; reason?: string }> => {
   if (Platform.OS === 'web') return { canSync: false, reason: 'ENTORNO_WEB' };
   try {
@@ -62,7 +76,7 @@ export const checkCanSync = async (forceOnCellular: boolean = false): Promise<{ 
  */
 export const startBackgroundSync = async (options: SyncOptions = {}): Promise<SyncResult> => {
   const batchSize = options.batchSize ?? 15;
-  const backendUrl = (options.backendUrl ?? DEFAULT_BACKEND_URL).replace(/\/$/, '');
+  const backendUrl = (options.backendUrl ?? CONFIGURED_BACKEND_URL).replace(/\/$/, '');
   const forceOnCellular = options.forceOnCellular ?? false;
 
   const result: SyncResult = {
@@ -71,6 +85,11 @@ export const startBackgroundSync = async (options: SyncOptions = {}): Promise<Sy
     failedCount: 0,
     errors: [],
   };
+
+  if (!backendUrl) {
+    result.reason = 'BACKEND_NO_CONFIGURADO';
+    return result;
+  }
 
   // 1. Verificación estricta de Wi-Fi
   const networkCheck = await checkCanSync(forceOnCellular);
@@ -106,7 +125,7 @@ export const startBackgroundSync = async (options: SyncOptions = {}): Promise<Sy
     // A. Consultar endpoint en lote para Letras (/api/lyrics/)
     let lyricsResultsMap: Record<string, any> = {};
     try {
-      const lyricsResp = await fetch(`${backendUrl}/api/lyrics/`, {
+      const lyricsResp = await fetchWithTimeout(`${backendUrl}/api/lyrics/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tracks: payloadTracks }),
@@ -127,7 +146,7 @@ export const startBackgroundSync = async (options: SyncOptions = {}): Promise<Sy
     // B. Consultar endpoint en lote para Análisis DSP (/api/analyze/)
     let dspResultsMap: Record<string, any> = {};
     try {
-      const dspResp = await fetch(`${backendUrl}/api/analyze/`, {
+      const dspResp = await fetchWithTimeout(`${backendUrl}/api/analyze/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tracks: payloadTracks }),
@@ -184,14 +203,13 @@ export const startBackgroundSync = async (options: SyncOptions = {}): Promise<Sy
         }
       }
 
-      // Si no obtuvimos datos o ya estaban, igual llamamos a updateTrackAnalysis con los valores existentes
-      // para marcar needs_sync = 0 y no repetir intentos en vano cada vez
-      const success = await updateTrackAnalysis(track.id, {
-        bpm: updatePayload.bpm ?? track.bpm,
-        camelot_key: updatePayload.camelot_key ?? track.camelot_key ?? '8A',
-        lyrics_json: updatePayload.lyrics_json ?? track.lyrics_json,
-        lyrics_lrc: updatePayload.lyrics_lrc ?? track.lyrics_lrc,
-      });
+      // Una respuesta vacia no debe marcar la pista como analizada ni fabricar BPM/tonalidad.
+      if (!hasNewData) {
+        result.failedCount++;
+        continue;
+      }
+
+      const success = await updateTrackAnalysis(track.id, updatePayload);
 
       if (success) {
         result.syncedCount++;
@@ -219,8 +237,8 @@ export const startBackgroundSync = async (options: SyncOptions = {}): Promise<Sy
 /**
  * Sincroniza inmediatamente una única pista seleccionada por el usuario en NowPlayingModal o LyricsModal.
  */
-export const syncSingleTrack = async (track: Track, backendUrl: string = DEFAULT_BACKEND_URL): Promise<boolean> => {
-  if (!track || !track.id) return false;
+export const syncSingleTrack = async (track: Track, backendUrl: string = CONFIGURED_BACKEND_URL): Promise<boolean> => {
+  if (!track || !track.id || !backendUrl) return false;
   try {
     const networkCheck = await checkCanSync(true); // Permite celular en petición única explícita del usuario
     if (!networkCheck.canSync) return false;
@@ -236,12 +254,12 @@ export const syncSingleTrack = async (track: Track, backendUrl: string = DEFAULT
 
     const cleanUrl = backendUrl.replace(/\/$/, '');
     const [lyricsResp, dspResp] = await Promise.all([
-      fetch(`${cleanUrl}/api/lyrics/`, {
+      fetchWithTimeout(`${cleanUrl}/api/lyrics/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tracks: payload }),
       }).catch(() => null),
-      fetch(`${cleanUrl}/api/analyze/`, {
+      fetchWithTimeout(`${cleanUrl}/api/analyze/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tracks: payload }),
@@ -252,18 +270,23 @@ export const syncSingleTrack = async (track: Track, backendUrl: string = DEFAULT
     if (lyricsResp && lyricsResp.ok) {
       const data = await lyricsResp.json();
       const item = (data?.results ?? [])[0] ?? data;
-      if (item && item.lyrics_lrc !== undefined) updateData.lyrics_lrc = item.lyrics_lrc;
-      if (item && item.lyrics_json !== undefined) {
+      if (item?.success && item.lyrics_lrc) updateData.lyrics_lrc = item.lyrics_lrc;
+      if (
+        item?.success &&
+        item.lyrics_json &&
+        (typeof item.lyrics_json === 'string' || (Array.isArray(item.lyrics_json) && item.lyrics_json.length > 0))
+      ) {
         updateData.lyrics_json = typeof item.lyrics_json === 'string' ? item.lyrics_json : JSON.stringify(item.lyrics_json);
       }
     }
     if (dspResp && dspResp.ok) {
       const data = await dspResp.json();
       const item = (data?.results ?? [])[0] ?? data;
-      if (item && item.bpm !== undefined) updateData.bpm = Number(item.bpm);
-      if (item && item.camelot_key !== undefined) updateData.camelot_key = String(item.camelot_key);
+      if (item?.success && item.bpm !== undefined) updateData.bpm = Number(item.bpm);
+      if (item?.success && item.camelot_key !== undefined) updateData.camelot_key = String(item.camelot_key);
     }
 
+    if (Object.keys(updateData).length === 0) return false;
     return await updateTrackAnalysis(track.id, updateData);
   } catch (error) {
     console.error(`[SyncService] Error en syncSingleTrack para ${track.id}:`, error);

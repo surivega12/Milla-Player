@@ -8,20 +8,15 @@ import {
   Image,
   ScrollView,
   Alert,
+  Share as NativeShare,
 } from 'react-native';
 import {
   ListPlus,
   ListMinus,
   ListMusic,
-  FolderPlus,
   Disc,
-  Mic,
   Share,
-  Tag,
   Info,
-  Bell,
-  Ban,
-  Trash2,
   Play,
   FileText,
 } from 'lucide-react-native';
@@ -96,10 +91,22 @@ export const TrackOptionsModal: React.FC<TrackOptionsModalProps> = ({
     onClose();
   };
 
-
-  const handleNotImplemented = (featureName: string) => {
-    Alert.alert('En desarrollo', `La función "${featureName}" estará disponible próximamente.`);
+  const handleShare = async () => {
+    await NativeShare.share({
+      title: track.title,
+      message: `${track.title} - ${track.artist}${track.url?.startsWith('http') ? `\n${track.url}` : ''}`,
+    });
     onClose();
+  };
+
+  const handleDetails = () => {
+    const duration = track.duration
+      ? `${Math.floor(track.duration / 60)}:${String(Math.floor(track.duration % 60)).padStart(2, '0')}`
+      : 'Desconocida';
+    Alert.alert(
+      'Detalles de la pista',
+      `Titulo: ${track.title}\nArtista: ${track.artist}\nAlbum: ${track.album || 'Sin album'}\nDuracion: ${duration}\nCalidad: ${track.qualityBadge || 'Audio local'}\nBPM: ${track.bpm || 'Sin analizar'}\nTonalidad: ${track.camelot_key || track.key || 'Sin analizar'}`
+    );
   };
 
   const renderOption = (icon: React.ReactNode, title: string, onPress: () => void) => (
@@ -175,15 +182,8 @@ export const TrackOptionsModal: React.FC<TrackOptionsModalProps> = ({
                 {renderOption(<ListMusic size={22} color={ICON_COLOR} />, 'Agregar a la cola de reproducción', handleAddToQueue)}
                 {renderOption(<ListMinus size={22} color={ICON_COLOR} />, 'Eliminar de la cola de reproducción', handleRemoveFromQueue)}
                 {renderOption(<FileText size={22} color={ICON_COLOR} />, 'Ir a la letra', handleGoToLyrics)}
-                {renderOption(<FolderPlus size={22} color={ICON_COLOR} />, 'Agregar a playlist', () => handleNotImplemented('Agregar a playlist'))}
-                {renderOption(<Disc size={22} color={ICON_COLOR} />, 'Ir al álbum', () => handleNotImplemented('Ir al álbum'))}
-                {renderOption(<Mic size={22} color={ICON_COLOR} />, 'Ir al artista', () => handleNotImplemented('Ir al artista'))}
-                {renderOption(<Share size={22} color={ICON_COLOR} />, 'Compartir', () => handleNotImplemented('Compartir'))}
-                {renderOption(<Tag size={22} color={ICON_COLOR} />, 'Editor de etiquetas', () => handleNotImplemented('Editor de etiquetas'))}
-                {renderOption(<Info size={22} color={ICON_COLOR} />, 'Detalles', () => handleNotImplemented('Detalles'))}
-                {renderOption(<Bell size={22} color={ICON_COLOR} />, 'Establecer como tono de llamada', () => handleNotImplemented('Establecer como tono de llamada'))}
-                {renderOption(<Ban size={22} color={ICON_COLOR} />, 'Agregar a la lista negra', () => handleNotImplemented('Agregar a la lista negra'))}
-                {renderOption(<Trash2 size={22} color={ICON_COLOR} />, 'Eliminar del dispositivo', () => handleNotImplemented('Eliminar del dispositivo'))}
+                {renderOption(<Share size={22} color={ICON_COLOR} />, 'Compartir', handleShare)}
+                {renderOption(<Info size={22} color={ICON_COLOR} />, 'Detalles', handleDetails)}
               </ScrollView>
             </View>
           </TouchableWithoutFeedback>

@@ -5,6 +5,7 @@ node_modules/
 
 # Expo
 .expo/
+.expo-export-check/
 dist/
 web-build/
 expo-env.d.ts
@@ -44,3 +45,5 @@ yarn-error.*
 .npm-cache/
 *.db
 *.db-journal
+__pycache__/
+*.pyc

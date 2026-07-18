@@ -67,7 +67,9 @@ class LyricsEndpointView(APIView):
 
                 try:
                     res = LyricsEngine.get_or_fetch_lyrics(track_id, title, artist, album, duration)
-                    res["success"] = True
+                    res["success"] = bool(res.get("lyrics_lrc") or res.get("lyrics_json"))
+                    if not res["success"]:
+                        res["reason"] = "Lyrics not found"
                     results.append(res)
                 except Exception as e:
                     results.append({"track_id": track_id, "success": False, "error": str(e)})
@@ -142,19 +144,12 @@ class AudioDSPAnalyzeView(APIView):
                         "success": True
                     })
                 else:
-                    # Si no está cacheado en servidor, estimamos BPM heurístico o por defecto audiófilo
-                    fallback_bpm = float(t.get('bpm') or 120.0)
-                    fallback_key = str(t.get('camelot_key') or '8A')
+                    # Sin audio real no se inventan valores: el cliente debe subir un archivo para analizarlo.
                     results.append({
                         "track_id": track_id,
-                        "bpm": fallback_bpm,
-                        "camelot_key": fallback_key,
-                        "vocal_silence_start_ms": 0.0,
-                        "vocal_silence_end_ms": 0.0,
-                        "intro_duration_ms": 0.0,
-                        "outro_duration_ms": 0.0,
                         "cached": False,
-                        "success": True
+                        "success": False,
+                        "reason": "AUDIO_REQUIRED"
                     })
             return Response({"results": results}, status=status.HTTP_200_OK)
 

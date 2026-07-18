@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { View, Text, Image, TouchableOpacity, StyleSheet } from 'react-native';
 import {
   Play,
@@ -56,6 +56,11 @@ export interface MiniPlayerProps {
   onPrev?: () => void;
   onToggleLike?: () => void;
   onPressBar?: () => void;
+  onOpenLyrics?: () => void;
+  onAddToPlaylist?: () => void;
+  onSleepTimer?: () => void;
+  onOpenQueue?: () => void;
+  onCast?: () => void;
 }
 
 const formatTime = (secs?: number): string => {
@@ -76,14 +81,24 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
   onPrev,
   onToggleLike,
   onPressBar,
+  onOpenLyrics,
+  onAddToPlaylist,
+  onSleepTimer,
+  onOpenQueue,
+  onCast,
 }) => {
   // Conexión en vivo con react-native-track-player
   const progressData = useProgress();
   const activeTrackData = useActiveTrack();
   const playbackState = usePlaybackState();
+  const [artworkFailed, setArtworkFailed] = useState(false);
 
   // Pista actual combinada (hook nativo o fallback por props)
   const displayTrack = (activeTrackData as unknown as Track) || track;
+
+  useEffect(() => {
+    setArtworkFailed(false);
+  }, [displayTrack?.id, displayTrack?.artwork, displayTrack?.artwork_thumb]);
 
   if (!displayTrack) {
     return null;
@@ -159,11 +174,12 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
           className="flex-row items-center flex-1 mr-3"
         >
           <View className="w-12 h-12 rounded-lg bg-neutral-800 overflow-hidden mr-3 border border-neutral-700/50 items-center justify-center">
-            {displayArtwork ? (
+            {displayArtwork && !artworkFailed ? (
               <Image
                 source={{ uri: displayArtwork }}
                 className="w-full h-full"
                 resizeMode="cover"
+                onError={() => setArtworkFailed(true)}
               />
             ) : (
               <Disc size={24} color="#6B7280" />
@@ -211,7 +227,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
 
           {/* 2. Micrófono (Letras) */}
           <TouchableOpacity
-            onPress={onPressBar}
+            onPress={onOpenLyrics || onPressBar}
             hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
             className="p-1"
           >
@@ -220,7 +236,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
 
           {/* 3. Añadir a lista de reproducción */}
           <TouchableOpacity
-            onPress={() => {}}
+            onPress={onAddToPlaylist}
             hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
             className="p-1"
           >
@@ -229,7 +245,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
 
           {/* 4. Reloj (Temporizador / Sleep Timer) */}
           <TouchableOpacity
-            onPress={onPressBar}
+            onPress={onSleepTimer || onPressBar}
             hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
             className="p-1"
           >
@@ -238,7 +254,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
 
           {/* 5. Lista de Reproducción / Cola */}
           <TouchableOpacity
-            onPress={onPressBar}
+            onPress={onOpenQueue || onPressBar}
             hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
             className="p-1"
           >
@@ -327,6 +343,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
             <TouchableOpacity
               onPress={(e) => {
                 e.stopPropagation();
+                onCast?.();
               }}
               hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
               className="p-1.5 rounded-lg bg-white/10 border border-white/20 items-center justify-center shadow-lg"

@@ -17,6 +17,7 @@ import {
   StyleSheet,
   Dimensions,
   Modal,
+  Alert,
 } from 'react-native';
 import { BlurView } from 'expo-blur';
 import { FlashList } from '@shopify/flash-list';
@@ -26,8 +27,6 @@ import Animated, {
   withTiming,
 } from 'react-native-reanimated';
 import {
-  ChevronDown,
-  Sparkles,
   MicVocal,
   Music2,
   Clock,
@@ -47,10 +46,11 @@ import TrackPlayer, { useProgress } from 'react-native-track-player';
 import { getColors } from 'react-native-image-colors';
 
 import { getThemeColors } from '../utils/theme-colors';
-import { parseLrc, getDemoLyrics, LyricLine } from '../utils/lyrics';
+import { parseLrc, LyricLine } from '../utils/lyrics';
 import { Track } from '../components/PlayerBar';
+import LyricsWaveDom from '../components/LyricsWaveDom';
 
-const { width, height } = Dimensions.get('window');
+const { height } = Dimensions.get('window');
 
 export interface LyricsModalProps {
   isOpen: boolean;
@@ -159,19 +159,23 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
   const colors = getThemeColors(currentTheme);
   const flashListRef = useRef<any>(null);
   const [dominantColor, setDominantColor] = useState<string>('#8b5cf6');
+  const [waveMode, setWaveMode] = useState(true);
+  const [waveReloadNonce, setWaveReloadNonce] = useState(0);
+  const [timingOffsetMs, setTimingOffsetMs] = useState(0);
+  const [seekDraft, setSeekDraft] = useState<number | null>(null);
 
   // 1. Consumir hook de progreso de react-native-track-player (frecuencia 100ms para precisión milimétrica)
-  const { position: progressSec } = useProgress(100);
+  const { position: progressSec, duration: nativeDuration } = useProgress(500);
 
   // Calcular segundos actuales exactos (priorizando el hook del motor nativo TrackPlayer)
   const currentSeconds = useMemo(() => {
-    if (progressSec > 0) return progressSec;
+    if (progressSec >= 0 && nativeDuration > 0) return Math.max(0, progressSec + timingOffsetMs / 1000);
     if (!track || !track.duration) return 0;
-    return progress * track.duration;
-  }, [progressSec, track, progress]);
+    return Math.max(0, progress * track.duration + timingOffsetMs / 1000);
+  }, [progressSec, nativeDuration, track, progress, timingOffsetMs]);
 
   // 2. Extraer el color vibrante de la carátula activa para el Glassmorphism y Highlights
-  const imageUrl = track?.artwork || track?.artwork_thumb;
+  const imageUrl = track?.artwork_thumb || track?.artwork;
   useEffect(() => {
     let isMounted = true;
     if (!imageUrl) {
@@ -223,7 +227,7 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
     }
 
     // B. Fallback a parsear el formato .lrc en bruto
-    const rawLrc = track.lyrics_lrc || (track as any).lyrics || getDemoLyrics(track.id, track);
+    const rawLrc = track.lyrics_lrc || (track as any).lyrics || '';
     return parseLrc(rawLrc);
   }, [track]);
 
@@ -274,8 +278,14 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
       }
     } catch (error) {
       console.error('[LyricsModal] Error ejecutando seekTo al tocar línea:', error);
+    } finally {
+      setSeekDraft(null);
     }
   }, [onSeekToTime]);
+
+  const cycleTimingOffset = () => {
+    setTimingOffsetMs((current) => current === 0 ? 250 : current === 250 ? -250 : 0);
+  };
 
   if (!isOpen || !track) {
     return null;
@@ -320,16 +330,18 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
                 Lyrics
               </Text>
               <View className="px-2 py-0.5 rounded-md bg-white/15 border border-white/20">
-                <Text className="text-[11px] font-bold text-neutral-300">+0.0s</Text>
+                <Text className="text-[11px] font-bold text-neutral-300">
+                  {timingOffsetMs >= 0 ? '+' : ''}{(timingOffsetMs / 1000).toFixed(2)}s
+                </Text>
               </View>
             </View>
 
             <View className="flex-row items-center gap-4">
-              <TouchableOpacity onPress={() => {}} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+              <TouchableOpacity onPress={() => setWaveReloadNonce((value) => value + 1)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
                 <RefreshCw size={18} color="#a3a3a3" />
               </TouchableOpacity>
-              <TouchableOpacity onPress={() => {}} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
-                <Globe size={18} color="#a3a3a3" />
+              <TouchableOpacity onPress={() => setWaveMode((value) => !value)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+                <Globe size={18} color={waveMode ? '#fed7aa' : '#a3a3a3'} />
               </TouchableOpacity>
               <TouchableOpacity
                 onPress={onClose}
@@ -344,7 +356,19 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
 
           {/* Renderizado de Alto Rendimiento con FlashList */}
           <View className="flex-1 my-2">
-            {lyricLines.length === 0 ? (
+            {waveMode ? (
+              <LyricsWaveDom
+                key={`${track.id}-${waveReloadNonce}`}
+                title={track.title || ''}
+                artist={track.artist || ''}
+                album={track.album}
+                durationMs={(nativeDuration || track.duration || 0) * 1000}
+                currentTimeMs={currentSeconds * 1000}
+                isPlaying={isPlaying}
+                highlightColor="#f6f4ef"
+                onSeek={handleSeekToLyric}
+              />
+            ) : lyricLines.length === 0 ? (
               <View className="flex-1 items-center justify-center px-8 text-center">
                 <MicVocal size={48} color="rgba(255,255,255,0.3)" style={{ marginBottom: 14 }} />
                 <Text className="text-lg font-black text-white text-center">
@@ -413,7 +437,7 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
                 <TouchableOpacity onPress={onOpenQueue || (() => {})} className="p-1">
                   <List size={20} color="#a3a3a3" />
                 </TouchableOpacity>
-                <TouchableOpacity onPress={() => {}} className="p-1">
+                <TouchableOpacity onPress={cycleTimingOffset} className="p-1">
                   <Clock size={20} color="#a3a3a3" />
                 </TouchableOpacity>
               </View>
@@ -424,8 +448,10 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
               <Slider
                 style={{ width: '100%', height: 24 }}
                 minimumValue={0}
-                maximumValue={track.duration || 225}
-                value={currentSeconds}
+                maximumValue={Math.max(nativeDuration || track.duration || 0, 1)}
+                value={seekDraft ?? currentSeconds}
+                onSlidingStart={() => setSeekDraft(currentSeconds)}
+                onValueChange={setSeekDraft}
                 onSlidingComplete={(val) => handleSeekToLyric(val)}
                 minimumTrackTintColor="#fed7aa"
                 maximumTrackTintColor="rgba(255,255,255,0.15)"
@@ -463,7 +489,7 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
                 <SkipForward size={24} color="#ffffff" />
               </TouchableOpacity>
 
-              <TouchableOpacity onPress={onClose} className="p-2">
+              <TouchableOpacity onPress={() => Alert.alert('Transmitir', 'No se encontro un dispositivo de audio disponible en la red.')} className="p-2">
                 <Cast size={20} color="#a3a3a3" />
               </TouchableOpacity>
             </View>

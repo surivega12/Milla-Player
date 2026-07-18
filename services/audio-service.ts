@@ -111,13 +111,61 @@ export async function playPlaylist(tracks: Track[], startIndex: number = 0) {
   await setupPlayer();
   await TrackPlayer.reset();
 
-  const playlist = tracks.map(toTrackPlayerTrack);
+  if (tracks.length === 0) {
+    throw new Error('La lista de reproduccion esta vacia.');
+  }
+
+  const safeStartIndex = Math.max(0, Math.min(startIndex, Math.max(tracks.length - 1, 0)));
+  globalVertexQueueManager.setCatalog(tracks);
+  let selectedTracks = tracks;
+  let selectedStartIndex = safeStartIndex;
+
+  if (tracks.length > 0 && globalVertexQueueManager.isAutoMixActive()) {
+    const current = tracks[safeStartIndex];
+    globalVertexQueueManager.setCurrentTrack(current);
+    const next = globalVertexQueueManager.peekNextTrack();
+    selectedTracks = next && next.id !== current.id ? [current, next] : [current];
+    selectedStartIndex = 0;
+  }
+
+  const playlist = selectedTracks.map(toTrackPlayerTrack);
 
   await TrackPlayer.add(playlist);
-  if (startIndex > 0 && startIndex < playlist.length) {
-    await TrackPlayer.skip(startIndex);
+  if (selectedStartIndex > 0 && selectedStartIndex < playlist.length) {
+    await TrackPlayer.skip(selectedStartIndex);
   }
   await TrackPlayer.play();
+}
+
+export async function configureAutoMixQueue(
+  tracks: Track[],
+  currentTrack: Track | null,
+  enabled: boolean
+): Promise<void> {
+  globalVertexQueueManager.setSessionAutoMixForced(enabled);
+  globalVertexQueueManager.setCatalog(tracks);
+  if (Platform.OS === 'web' || !currentTrack) return;
+
+  const activeIndex = await TrackPlayer.getActiveTrackIndex();
+  if (activeIndex === undefined || activeIndex === null || activeIndex < 0) return;
+  const queue = await TrackPlayer.getQueue();
+  const upcomingIndexes = queue
+    .map((_, index) => index)
+    .filter((index) => index > activeIndex);
+  if (upcomingIndexes.length > 0) await TrackPlayer.remove(upcomingIndexes);
+
+  if (enabled) {
+    globalVertexQueueManager.setCurrentTrack(currentTrack);
+    const next = globalVertexQueueManager.peekNextTrack();
+    if (next) await TrackPlayer.add(toTrackPlayerTrack(next), activeIndex + 1);
+    return;
+  }
+
+  const catalogIndex = tracks.findIndex((track) => track.id === currentTrack.id);
+  const remainingTracks = catalogIndex >= 0 ? tracks.slice(catalogIndex + 1) : [];
+  if (remainingTracks.length > 0) {
+    await TrackPlayer.add(remainingTracks.map(toTrackPlayerTrack), activeIndex + 1);
+  }
 }
 
 export async function clearQueue(): Promise<void> {
