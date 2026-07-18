@@ -5,17 +5,36 @@ Backend de cálculos pesados audiófilos (Letras sincronizadas LRC, Librosa BPM/
 """
 import os
 from pathlib import Path
+from django.core.exceptions import ImproperlyConfigured
+from django.core.management.utils import get_random_secret_key
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-vertex-cloud-audiophile-engine-key-2026')
+ENVIRONMENT = os.environ.get('DJANGO_ENV', 'development').strip().lower()
+IS_PRODUCTION = ENVIRONMENT in {'production', 'prod'}
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.environ.get('DJANGO_DEBUG', 'True').lower() in ('true', '1', 'yes')
 
-ALLOWED_HOSTS = ['*']  # Permite conexiones desde dispositivos Android en la misma red local o nube
+def env_list(name, default=''):
+    return [value.strip() for value in os.environ.get(name, default).split(',') if value.strip()]
+
+
+# Las claves de producción jamás tienen un valor por defecto versionado. En desarrollo se genera
+# una clave efímera para que el backend local pueda arrancar sin exponer credenciales reales.
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY')
+if not SECRET_KEY:
+    if IS_PRODUCTION:
+        raise ImproperlyConfigured('DJANGO_SECRET_KEY debe configurarse en producción.')
+    SECRET_KEY = get_random_secret_key()
+
+DEBUG = os.environ.get('DJANGO_DEBUG', 'false' if IS_PRODUCTION else 'true').lower() in ('true', '1', 'yes')
+
+ALLOWED_HOSTS = env_list(
+    'DJANGO_ALLOWED_HOSTS',
+    'localhost,127.0.0.1' if DEBUG else '',
+)
+if not DEBUG and not ALLOWED_HOSTS:
+    raise ImproperlyConfigured('DJANGO_ALLOWED_HOSTS debe configurarse cuando DEBUG=False.')
 
 
 # Application definition
@@ -129,8 +148,14 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # Default primary key field type
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# Configuración CORS para React Native / Expo
-CORS_ALLOW_ALL_ORIGINS = True
+# Configuración CORS para React Native / Expo. Los clientes nativos no envían Origin, pero Expo
+# web y los paneles de desarrollo deben declararse explícitamente mediante variables de entorno.
+CORS_ALLOW_ALL_ORIGINS = False
+CORS_ALLOWED_ORIGINS = env_list(
+    'DJANGO_CORS_ALLOWED_ORIGINS',
+    'http://localhost:8081,http://127.0.0.1:8081,http://localhost:19006' if DEBUG else '',
+)
+CSRF_TRUSTED_ORIGINS = CORS_ALLOWED_ORIGINS
 CORS_ALLOW_HEADERS = [
     'accept',
     'accept-encoding',

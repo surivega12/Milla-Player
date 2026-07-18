@@ -6,7 +6,26 @@ import TrackPlayer, {
 import { Platform } from 'react-native';
 import { Track } from '../components/PlayerBar';
 import { globalVertexQueueManager } from './queue-service';
+import { isUnresolvedSafUri, sanitizeTrackUriForPlayback } from './library-service';
 
+function toTrackPlayerTrack(track: Track) {
+  const sourceUri = track.url || track.id;
+  const playableUri = sanitizeTrackUriForPlayback(sourceUri);
+
+  if (!playableUri || isUnresolvedSafUri(playableUri)) {
+    throw new Error(`La pista "${track.title || track.id}" sigue usando una URI SAF no reproducible. Vuelve a escanear la carpeta.`);
+  }
+
+  return {
+    id: track.id,
+    url: playableUri,
+    title: track.title || 'Canción Sin Título',
+    artist: track.artist || 'Artista Desconocido',
+    album: track.album || 'Milla Hi-Res Library',
+    artwork: track.artwork_thumb || track.artwork,
+    duration: track.duration || 0,
+  };
+}
 
 export async function setupPlayer(): Promise<boolean> {
   if (Platform.OS === 'web') {
@@ -25,7 +44,7 @@ export async function setupPlayer(): Promise<boolean> {
       maxBuffer: 50,      // Máximo de búfer en segundos para almacenar en caché de reproducción
       playBuffer: 5,      // Búfer requerido en segundos para reanudar después de pausa
       backBuffer: 30,     // Búfer guardado detrás para rebobinado instantáneo
-      maxCacheSize: 1024 * 1024 * 5, // Búfer de caché física (5GB)
+      maxCacheSize: 1024 * 1024 * 50, // Caché de 50 MB para streams; los archivos locales no se duplican.
       waitForBuffer: true,
     } as any);
 
@@ -78,15 +97,7 @@ export async function playTrack(track: Track) {
   await TrackPlayer.reset();
 
   // Agregar la pista al reproductor nativo (100% archivos locales reales)
-  await TrackPlayer.add({
-    id: track.id,
-    url: track.url || track.id,
-    title: track.title || 'Canción Sin Título',
-    artist: track.artist || 'Artista Desconocido',
-    album: track.album || 'Milla Hi-Res Library',
-    artwork: track.artwork_thumb || track.artwork,
-    duration: track.duration || 0,
-  });
+  await TrackPlayer.add(toTrackPlayerTrack(track));
 
   await TrackPlayer.play();
 }
@@ -100,15 +111,7 @@ export async function playPlaylist(tracks: Track[], startIndex: number = 0) {
   await setupPlayer();
   await TrackPlayer.reset();
 
-  const playlist = tracks.map((track) => ({
-    id: track.id,
-    url: track.url || track.id,
-    title: track.title || 'Canción Sin Título',
-    artist: track.artist || 'Artista Desconocido',
-    album: track.album || 'Milla Hi-Res Library',
-    artwork: track.artwork_thumb || track.artwork,
-    duration: track.duration || 0,
-  }));
+  const playlist = tracks.map(toTrackPlayerTrack);
 
   await TrackPlayer.add(playlist);
   if (startIndex > 0 && startIndex < playlist.length) {
@@ -143,4 +146,3 @@ export async function clearQueue(): Promise<void> {
     console.warn('Error al limpiar la cola:', e);
   }
 }
-

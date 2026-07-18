@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -12,7 +12,6 @@ import {
 import { FlashList } from '@shopify/flash-list';
 import Animated, { useSharedValue, useAnimatedScrollHandler } from 'react-native-reanimated';
 import { AnimatedHeader } from '../components/AnimatedHeader';
-import { BlurView } from 'expo-blur';
 
 const AnimatedFlashList = Animated.createAnimatedComponent(FlashList as any);
 import {
@@ -31,12 +30,30 @@ import { TrackOptionsModal } from '../components/TrackOptionsModal';
 import { Track } from '../components/PlayerBar';
 import { getThemeColors } from '../utils/theme-colors';
 import { useTheme } from '../context/ThemeContext';
-import { getCachedTracks } from '../services/database-service';
+import { getCachedTracks, insertTracks } from '../services/database-service';
 import { globalVertexQueueManager } from '../services/queue-service';
+import { extractMetadata } from '../services/metadata-service';
+import { sanitizeTrackUriForPlayback } from '../services/library-service';
 
 const { width } = Dimensions.get('window');
 const COLUMN_COUNT = 1;
 const CARD_WIDTH = '100%';
+
+const ARTWORK_FALLBACKS = [
+  { background: '#DDF3EF', accent: '#8BC9C0', highlight: '#F7D6A5', text: '#155A56' },
+  { background: '#E7E5FF', accent: '#B7B3F2', highlight: '#F6C9DF', text: '#49417D' },
+  { background: '#FFE8DE', accent: '#F3B399', highlight: '#F6D98B', text: '#91442B' },
+  { background: '#DFECFF', accent: '#9FC3EE', highlight: '#C8E7D6', text: '#24567C' },
+];
+
+function getArtworkFallback(track: Track) {
+  const label = (track.artist || track.title || 'Milla').trim();
+  const seed = Array.from(label).reduce((total, character) => total + character.charCodeAt(0), 0);
+  return {
+    ...ARTWORK_FALLBACKS[seed % ARTWORK_FALLBACKS.length],
+    initial: label.charAt(0).toLocaleUpperCase() || 'M',
+  };
+}
 
 export type SortOption = 'title' | 'artist' | 'album' | 'quality';
 
@@ -63,6 +80,7 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [sortBy, setSortBy] = useState<SortOption>('title');
   const [filterLosslessOnly, setFilterLosslessOnly] = useState<boolean>(false);
+  const artworkRequestsRef = useRef<Set<string>>(new Set());
 
   const scrollY = useSharedValue(0);
   const headerTranslationY = useSharedValue(0);
@@ -113,6 +131,63 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
     }
     loadTracksFromDatabase(localTracks.length === 0);
   }, [propTracks, loadTracksFromDatabase]);
+
+  // Las carátulas se hidratan con la ruta local ya saneada y se guardan nuevamente en SQLite.
+  // Un conjunto de solicitudes evita releer el mismo archivo durante actualizaciones de la lista.
+  useEffect(() => {
+    let cancelled = false;
+    const candidates = localTracks.filter((track) => {
+      const hasArtwork = Boolean(track.artwork_thumb || track.artwork);
+      return !hasArtwork && Boolean(track.url || track.id) && !artworkRequestsRef.current.has(track.id);
+    });
+
+    if (candidates.length === 0) return () => { cancelled = true; };
+    candidates.forEach((track) => artworkRequestsRef.current.add(track.id));
+
+    const hydrateArtwork = async () => {
+      const enrichedTracks: Track[] = [];
+      const BATCH_SIZE = 3;
+
+      for (let index = 0; index < candidates.length && !cancelled; index += BATCH_SIZE) {
+        const batch = candidates.slice(index, index + BATCH_SIZE);
+        const results = await Promise.all(batch.map(async (track) => {
+          try {
+            const playableUri = sanitizeTrackUriForPlayback(track.url || track.id);
+            const metadata = await extractMetadata(playableUri, track.id);
+            if (!metadata.artwork_thumb) return null;
+            return {
+              ...track,
+              url: playableUri,
+              artwork: metadata.artwork_thumb,
+              artwork_thumb: metadata.artwork_thumb,
+            };
+          } catch {
+            return null;
+          } finally {
+            artworkRequestsRef.current.delete(track.id);
+          }
+        }));
+
+        const foundArtwork = results.filter(
+          (track): track is NonNullable<typeof track> => track !== null
+        );
+        if (foundArtwork.length > 0 && !cancelled) {
+          enrichedTracks.push(...foundArtwork);
+          const byId = new Map(foundArtwork.map((track) => [track.id, track]));
+          setLocalTracks((current) => current.map((track) => byId.get(track.id) || track));
+        }
+      }
+
+      if (enrichedTracks.length > 0 && !cancelled) {
+        await insertTracks(enrichedTracks).catch((error) => {
+          console.warn('No se pudieron persistir las carátulas extraídas:', error);
+        });
+      }
+    };
+
+    hydrateArtwork();
+    return () => { cancelled = true; };
+  }, [localTracks]);
 
   const handleRefresh = async () => {
     setIsRefreshing(true);
@@ -201,6 +276,7 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
 
       // Si existe miniatura ultraligera en SQLite, usarla; si no, usar artwork o fallback
       const imageUrl = item.artwork_thumb || item.artwork;
+      const fallback = getArtworkFallback(item);
 
       return (
         <TouchableOpacity
@@ -222,8 +298,11 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
                 resizeMode="cover"
               />
             ) : (
-              <View className="flex-1 items-center justify-center bg-gradient-to-br from-neutral-800 to-neutral-950">
-                <Music2 size={20} color={colors.mutedForeground} />
+              <View style={[styles.artworkFallback, { backgroundColor: fallback.background }]}>
+                <View style={[styles.artworkBlob, { backgroundColor: fallback.accent }]} />
+                <View style={[styles.artworkHighlight, { backgroundColor: fallback.highlight }]} />
+                <Music2 size={19} color={fallback.text} style={styles.artworkIcon} />
+                <Text style={[styles.artworkInitial, { color: fallback.text }]}>{fallback.initial}</Text>
               </View>
             )}
             {/* Indicador de Reproducción Actual */}
@@ -342,3 +421,45 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
     </View>
   );
 };
+
+const styles = StyleSheet.create({
+  artworkFallback: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'hidden',
+  },
+  artworkBlob: {
+    position: 'absolute',
+    width: 54,
+    height: 54,
+    borderRadius: 27,
+    top: -18,
+    right: -16,
+    opacity: 0.8,
+  },
+  artworkHighlight: {
+    position: 'absolute',
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    bottom: -16,
+    left: -12,
+    opacity: 0.75,
+  },
+  artworkInitial: {
+    fontSize: 22,
+    fontWeight: '800',
+    letterSpacing: 0,
+  },
+  artworkIcon: {
+    position: 'absolute',
+    right: 5,
+    bottom: 5,
+    opacity: 0.65,
+  },
+});

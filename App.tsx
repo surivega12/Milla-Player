@@ -25,8 +25,8 @@ import TrackPlayer, {
   State,
 } from 'react-native-track-player';
 import { setupPlayer, playPlaylist } from './services/audio-service';
-import { scanLocalAudioFiles } from './services/library-service';
-import { initializeVertexDatabase, insertTracks } from './services/database-service';
+import { isUnresolvedSafUri, scanDeviceAudioFiles, scanManualMusicFolder, sanitizeTrackUriForPlayback } from './services/library-service';
+import { getCachedTracks, initializeVertexDatabase, insertTracks } from './services/database-service';
 import { searchRecording } from './services/musicbrainz-service';
 import { VertexQueueProvider, useVertexQueue, VertexTrack } from './services/queue-service';
 import {
@@ -104,9 +104,19 @@ function MainAppContent() {
 
         console.log('Inicializando base de datos VERTEX offline...');
         await initializeVertexDatabase();
+        const cachedTracks = await getCachedTracks();
+        const playableCachedTracks = cachedTracks.map((track) => {
+          const playableUrl = sanitizeTrackUriForPlayback(track.url || track.id);
+          return playableUrl && playableUrl !== track.url ? { ...track, url: playableUrl } : track;
+        });
+        const migratedCachedTracks = playableCachedTracks.filter((track, index) => track.url !== cachedTracks[index].url);
+        if (migratedCachedTracks.length > 0) {
+          await insertTracks(migratedCachedTracks);
+        }
+        setTracksList(playableCachedTracks);
+        setCatalog(playableCachedTracks as VertexTrack[]);
         await setupPlayer();
-        await syncDownloads();
-        setCatalog([] as VertexTrack[]);
+        await syncDownloads(playableCachedTracks);
         setIsDbReady(true);
 
         // 🚀 Punto 3.1: Encendido automático y silencioso del Worker en segundo plano tras 5 segundos
@@ -135,9 +145,9 @@ function MainAppContent() {
   }, [tracksList]);
 
   // Función para sincronizar la lista de descargas y tamaño de carpeta
-  const syncDownloads = async () => {
+  const syncDownloads = async (sourceTracks: Track[] = tracksList) => {
     const downloaded = new Set<string>();
-    for (const track of tracksList) {
+    for (const track of sourceTracks) {
       const localUri = await getLocalTrackUri(track.id);
       if (localUri) {
         downloaded.add(track.id);
@@ -206,7 +216,7 @@ function MainAppContent() {
       tracksList.map(async (t) => {
         const localUri = await getLocalTrackUri(t.id);
         if (localUri) {
-          return { ...t, id: localUri };
+          return { ...t, url: localUri };
         }
         return t;
       })
@@ -238,9 +248,13 @@ function MainAppContent() {
         if (existingIndex >= 0) {
           await TrackPlayer.skip(existingIndex);
         } else {
+          const nextTrackUrl = sanitizeTrackUriForPlayback(nextFromQueue.url || nextFromQueue.id);
+          if (isUnresolvedSafUri(nextTrackUrl)) {
+            throw new Error('La siguiente pista sigue usando una ruta SAF no reproducible. Vuelve a escanearla.');
+          }
           await TrackPlayer.add({
             id: nextFromQueue.id,
-            url: nextFromQueue.url || nextFromQueue.id,
+            url: nextTrackUrl,
             title: nextFromQueue.title,
             artist: nextFromQueue.artist,
             album: nextFromQueue.album,
@@ -280,18 +294,19 @@ function MainAppContent() {
     );
   };
 
-  // Escáner nativo y web universal de música local (Selector de carpetas manual)
-  const handleScanLocal = async () => {
+  const runLibraryScan = async (manualFolder: boolean) => {
     setIsScanning(true);
-    setScanProgressText('Iniciando selector de carpeta...');
+    setScanProgressText(manualFolder ? 'Abriendo selector de carpeta...' : 'Buscando música en el dispositivo...');
     try {
-      const localSongs = await scanLocalAudioFiles((progressText) => {
+      const localSongs = await (manualFolder ? scanManualMusicFolder : scanDeviceAudioFiles)((progressText) => {
         setScanProgressText(progressText);
-      }, undefined, true);
+      });
       if (localSongs.length === 0) {
         Alert.alert(
           'Milla Library',
-          'No se encontraron archivos de audio compatibles en la carpeta seleccionada.'
+          manualFolder
+            ? 'No se encontraron archivos de audio compatibles en la carpeta seleccionada.'
+            : 'No se encontraron archivos de audio compatibles en la biblioteca del dispositivo.'
         );
       } else {
         setTracksList([...localSongs]);
@@ -310,6 +325,12 @@ function MainAppContent() {
       setScanProgressText('');
     }
   };
+
+  // Escaneo global de MediaLibrary: no abre SAF y aprovecha READ_MEDIA_AUDIO.
+  const handleScanLocal = async () => runLibraryScan(false);
+
+  // Escaneo manual independiente para una carpeta elegida mediante SAF.
+  const handleScanManualFolder = async () => runLibraryScan(true);
 
   // Reparación inteligente por MusicBrainz + cálculo de BPM/Tono Camelot y actualización en SQLite
   const handleOptimizeLibrary = async () => {
@@ -547,6 +568,7 @@ function MainAppContent() {
             onSelectTheme={setCurrentTheme}
             tracks={tracksList}
             onScanLocal={handleScanLocal}
+            onScanManualFolder={handleScanManualFolder}
             isScanning={isScanning}
             scanProgressText={scanProgressText}
             downloadedIds={downloadedIds}

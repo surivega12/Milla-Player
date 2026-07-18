@@ -1,5 +1,8 @@
 import os
 import tempfile
+import uuid
+from pathlib import Path
+from django.utils.text import get_valid_filename
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -164,11 +167,14 @@ class AudioDSPAnalyzeView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        # Guardar en archivo temporal seguro para que Librosa lo procese
-        suffix = os.path.splitext(audio_file.name)[1] or '.mp3'
+        # El nombre enviado por el cliente nunca se usa como ruta. Conservamos sólo una extensión
+        # validada y un nombre seguro para evitar path traversal en el directorio temporal.
+        safe_track_id = get_valid_filename(str(track_id))[:100] or 'unknown_track'
+        safe_filename = get_valid_filename(Path(audio_file.name).name)[:120] or 'audio.mp3'
+        suffix = Path(safe_filename).suffix.lower() or '.mp3'
         temp_dir = os.path.join(tempfile.gettempdir(), 'vertex_dsp_uploads')
         os.makedirs(temp_dir, exist_ok=True)
-        temp_path = os.path.join(temp_dir, f"upload_{track_id}_{audio_file.name}")
+        temp_path = os.path.join(temp_dir, f"upload_{safe_track_id}_{uuid.uuid4().hex}{suffix}")
 
         try:
             with open(temp_path, 'wb+') as dest:
@@ -176,7 +182,7 @@ class AudioDSPAnalyzeView(APIView):
                     dest.write(chunk)
 
             # Analizar el archivo temporal con DSPEngine
-            result = DSPEngine.analyze_fragment(temp_path, track_id=str(track_id))
+            result = DSPEngine.analyze_fragment(temp_path, track_id=safe_track_id)
 
             if os.path.exists(temp_path):
                 try:

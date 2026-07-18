@@ -2,6 +2,16 @@ import * as FileSystem from 'expo-file-system/legacy';
 
 const DOWNLOAD_DIR = FileSystem.documentDirectory + 'downloads/';
 
+function getDownloadFileUri(trackId: string): string {
+  const normalizedId = String(trackId || 'track');
+  let hash = 0;
+  for (let index = 0; index < normalizedId.length; index += 1) {
+    hash = (hash * 31 + normalizedId.charCodeAt(index)) | 0;
+  }
+  const safeStem = normalizedId.replace(/[^a-z0-9_-]/gi, '_').slice(-72) || 'track';
+  return `${DOWNLOAD_DIR}${safeStem}_${(hash >>> 0).toString(36)}.flac`;
+}
+
 // Asegura que la carpeta de descargas exista localmente
 async function ensureDirExists() {
   try {
@@ -19,7 +29,7 @@ async function ensureDirExists() {
  */
 export async function getLocalTrackUri(trackId: string): Promise<string | null> {
   await ensureDirExists();
-  const fileUri = DOWNLOAD_DIR + `${trackId}.flac`;
+  const fileUri = getDownloadFileUri(trackId);
   const fileInfo = await FileSystem.getInfoAsync(fileUri);
   if (fileInfo.exists) {
     return fileUri;
@@ -36,7 +46,7 @@ export async function downloadTrack(
   onProgress: (progress: number) => void
 ): Promise<string> {
   await ensureDirExists();
-  const fileUri = DOWNLOAD_DIR + `${trackId}.flac`;
+  const fileUri = getDownloadFileUri(trackId);
 
   // Si ya se encuentra descargada, retornar inmediatamente la URI local
   const fileInfo = await FileSystem.getInfoAsync(fileUri);
@@ -67,7 +77,7 @@ export async function downloadTrack(
  * Elimina una canción descargada del almacenamiento local.
  */
 export async function deleteTrackFile(trackId: string): Promise<void> {
-  const fileUri = DOWNLOAD_DIR + `${trackId}.flac`;
+  const fileUri = getDownloadFileUri(trackId);
   const fileInfo = await FileSystem.getInfoAsync(fileUri);
   if (fileInfo.exists) {
     await FileSystem.deleteAsync(fileUri);

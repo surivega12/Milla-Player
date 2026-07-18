@@ -55,6 +55,7 @@ interface HomeScreenProps {
   onSelectTheme: (theme: string) => void;
   tracks: Track[];
   onScanLocal: () => void;
+  onScanManualFolder: () => void;
   isScanning: boolean;
   scanProgressText?: string;
   downloadedIds: Set<string>;
@@ -74,6 +75,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   onSelectTheme,
   tracks,
   onScanLocal,
+  onScanManualFolder,
   isScanning,
   scanProgressText,
   downloadedIds,
@@ -820,20 +822,24 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                 : `${tracks.length} archivo(s) indexados en SQLite local`}
             </Text>
           </View>
-          <TouchableOpacity
-            onPress={onScanLocal}
-            disabled={isScanning}
-            className="px-4 py-2.5 rounded-2xl bg-white/10 border border-white/20 flex-row items-center gap-1.5"
-          >
-            {isScanning ? (
-              <ActivityIndicator size="small" color="#FFFFFF" />
-            ) : (
+          <View className="flex-row items-center gap-2">
+            <TouchableOpacity
+              onPress={onScanLocal}
+              disabled={isScanning}
+              className="px-3 py-2.5 rounded-2xl bg-sky-400/20 border border-sky-300/30 flex-row items-center gap-1.5"
+            >
+              {isScanning ? <ActivityIndicator size="small" color="#FFFFFF" /> : <RefreshCw size={15} color="#7DD3FC" />}
+              <Text className="text-xs font-bold text-white">Todo</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              onPress={onScanManualFolder}
+              disabled={isScanning}
+              className="px-3 py-2.5 rounded-2xl bg-white/10 border border-white/20 flex-row items-center gap-1.5"
+            >
               <FolderOpen size={15} color="#38BDF8" />
-            )}
-            <Text className="text-xs font-bold text-white">
-              {isScanning ? 'Escaneando' : 'Escanear Carpeta'}
-            </Text>
-          </TouchableOpacity>
+              <Text className="text-xs font-bold text-white">Carpeta</Text>
+            </TouchableOpacity>
+          </View>
         </View>
       </Animated.ScrollView>
 

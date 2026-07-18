@@ -1,10 +1,9 @@
 import * as MediaLibrary from 'expo-media-library/legacy';
 import * as FileSystem from 'expo-file-system/legacy';
-import * as ImageManipulator from 'expo-image-manipulator';
-import { Platform, Alert } from 'react-native';
+import { Platform } from 'react-native';
 import { Track } from '../components/PlayerBar';
 import { extractMetadata } from './metadata-service';
-import { getCachedTracks, insertTracks, deleteTracks, updateTrackUri, setWebMockTracks, getWebMockTracks } from './database-service';
+import { getCachedTracks, insertTracks, deleteTracks, updateTrackUri, setWebMockTracks } from './database-service';
 import jsmediatags from 'jsmediatags';
 
 export async function requestLibraryPermission(): Promise<boolean> {
@@ -66,29 +65,71 @@ export function normalizeNativeUri(uri: string): string {
   return decoded;
 }
 
-const generateThumbnail = async (base64Image: string, trackId: string): Promise<{ original: string, thumb: string } | null> => {
-  try {
-    const safeId = trackId.replace(/[^a-z0-9]/gi, '_');
-    const originalUri = FileSystem.documentDirectory + `${safeId}_original.jpg`;
-    
-    const base64Data = base64Image.replace(/^data:image\/\w+;base64,/, '');
-    await FileSystem.writeAsStringAsync(originalUri, base64Data, { encoding: FileSystem.EncodingType.Base64 });
+const SAF_EXTERNAL_STORAGE_PREFIX = 'content://com.android.externalstorage.documents/';
 
-    const result = await ImageManipulator.manipulateAsync(
-      originalUri,
-      [{ resize: { width: 150 } }],
-      { compress: 0.6, format: ImageManipulator.SaveFormat.JPEG }
-    );
+function toFileUri(absolutePath: string): string {
+  const normalizedPath = absolutePath.replace(/\\/g, '/').replace(/\/+/g, '/');
+  return `file://${encodeURI(normalizedPath.startsWith('/') ? normalizedPath : `/${normalizedPath}`)}`;
+}
 
-    return {
-      original: originalUri,
-      thumb: result.uri
-    };
-  } catch (error) {
-    console.warn('[LibraryService] Failed to generate thumbnail:', error);
-    return null;
+function getSafDocumentId(uri: string): string | null {
+  const decoded = decodeURIComponentSafe(uri);
+  const documentIndex = decoded.lastIndexOf('/document/');
+  const treeIndex = decoded.lastIndexOf('/tree/');
+  const markerIndex = documentIndex >= 0 ? documentIndex + '/document/'.length : treeIndex >= 0 ? treeIndex + '/tree/'.length : -1;
+
+  if (markerIndex < 0) return null;
+  const documentId = decoded.slice(markerIndex).split('?')[0].replace(/^\/+/, '');
+  return documentId || null;
+}
+
+/**
+ * Convierte los Document IDs de SAF en rutas que ExoPlayer y los lectores de tags pueden abrir.
+ * SAF no expone un API de JavaScript para resolver todos los proveedores de documentos; este puente
+ * cubre los documentos de almacenamiento externo de Android, incluidos los volúmenes SD montados.
+ */
+export function resolveAndroidContentUriToFileUri(uri: string): string | null {
+  if (Platform.OS !== 'android' || !uri) return null;
+
+  const decoded = decodeURIComponentSafe(uri);
+  if (!decoded.startsWith(SAF_EXTERNAL_STORAGE_PREFIX)) return null;
+
+  const documentId = getSafDocumentId(decoded);
+  if (!documentId) return null;
+
+  if (documentId.startsWith('raw:')) {
+    return toFileUri(documentId.slice('raw:'.length));
   }
-};
+
+  const separatorIndex = documentId.indexOf(':');
+  if (separatorIndex <= 0) return null;
+
+  const volume = documentId.slice(0, separatorIndex);
+  const relativePath = documentId.slice(separatorIndex + 1).replace(/^\/+/, '');
+  const storageRoot = volume.toLowerCase() === 'primary' ? '/storage/emulated/0' : `/storage/${volume}`;
+  return toFileUri(relativePath ? `${storageRoot}/${relativePath}` : storageRoot);
+}
+
+export function isUnresolvedSafUri(uri: string): boolean {
+  return decodeURIComponentSafe(uri).startsWith(SAF_EXTERNAL_STORAGE_PREFIX);
+}
+
+/**
+ * Sanitiza una ruta justo antes de persistirla o reproducirla. Los URIs de MediaStore ajenos a SAF
+ * se preservan porque Android puede concederles acceso directo; los de SAF se convierten a file://.
+ */
+export function sanitizeTrackUriForPlayback(uri: string): string {
+  if (!uri) return '';
+
+  const resolvedSafUri = resolveAndroidContentUriToFileUri(uri);
+  if (resolvedSafUri) return resolvedSafUri;
+
+  const normalized = normalizeNativeUri(uri);
+  if (normalized.startsWith('file://')) {
+    return toFileUri(normalized.slice('file://'.length));
+  }
+  return normalized.startsWith('/') ? toFileUri(normalized) : normalized;
+}
 
 /**
  * Helper para generar huella única anti-duplicados usando nombre de archivo + duración exacta en milisegundos.
@@ -213,49 +254,48 @@ async function scanWebFolderHybrid(
             } catch (err) {}
           }
 
-          const fileUrl = URL.createObjectURL(file);
-          const badge = getFileQualityBadge(file.name);
-
-          const tags: any = await new Promise((resolveTags) => {
-            jsmediatags.read(file, {
-              onSuccess: function(tag: any) {
-                resolveTags(tag.tags);
-              },
-              onError: function(error: any) {
-                resolveTags(null);
-              }
+          // Los Blob URL del selector sólo son válidos durante esta sesión. Se usan de forma
+          // transitoria para evitar retener archivos completos en memoria del navegador.
+          const transientUrl = URL.createObjectURL(file);
+          try {
+            const badge = getFileQualityBadge(file.name);
+            const tags: any = await new Promise((resolveTags) => {
+              jsmediatags.read(file, {
+                onSuccess: (tag: any) => resolveTags(tag.tags),
+                onError: () => resolveTags(null),
+              });
             });
-          });
 
-          let base64Cover: string | undefined = undefined;
-          if (tags && tags.picture) {
-            const { data, format } = tags.picture;
-            let base64String = "";
-            for (let j = 0; j < data.length; j++) {
-              base64String += String.fromCharCode(data[j]);
+            let base64Cover: string | undefined;
+            if (tags?.picture) {
+              const { data, format } = tags.picture;
+              let base64String = '';
+              for (let j = 0; j < data.length; j++) {
+                base64String += String.fromCharCode(data[j]);
+              }
+              base64Cover = `data:${format};base64,${btoa(base64String)}`;
             }
-            base64Cover = `data:${format};base64,${btoa(base64String)}`;
+
+            newWebTracks.push({
+              id: `web-local-${cleanName}_${file.size}`,
+              // El navegador no permite persistir el File seleccionado entre recargas. No se
+              // conserva el Blob URL revocado como una pista reproducible falsa.
+              url: '',
+              title: tags?.title || cleanName.replace(/_/g, ' '),
+              artist: tags?.artist || 'Unknown Artist',
+              album: tags?.album || '',
+              duration: Math.round((file.size || 5000000) / 32000),
+              qualityBadge: badge,
+              lyrics_lrc: lyricsText,
+              lyrics: lyricsText,
+              needs_repair: false,
+              needs_sync: false,
+              artwork: base64Cover,
+              artwork_thumb: base64Cover,
+            });
+          } finally {
+            URL.revokeObjectURL(transientUrl);
           }
-
-          const trackTitle = tags?.title || cleanName.replace(/_/g, ' ');
-          const trackArtist = tags?.artist || 'Unknown Artist';
-          const trackAlbum = tags?.album || '';
-
-          newWebTracks.push({
-            id: `web-local-${cleanName}_${file.size}`,
-            url: fileUrl,
-            title: trackTitle,
-            artist: trackArtist,
-            album: trackAlbum,
-            duration: Math.round((file.size || 5000000) / 32000),
-            qualityBadge: badge,
-            lyrics_lrc: lyricsText,
-            lyrics: lyricsText,
-            needs_repair: false,
-            needs_sync: false,
-            artwork: base64Cover,
-            artwork_thumb: base64Cover,
-          });
         }
 
         await setWebMockTracks(newWebTracks);
@@ -275,9 +315,7 @@ async function scanWebFolderHybrid(
   });
 }
 
-/**
- * Escáner recursivo universal de carpetas con try-catch y alertas de diagnóstico.
- */
+/** Escáner recursivo de carpetas locales y SAF sin diálogos de depuración. */
 export async function readDirectoryRecursivelyNative(
   dirUri: string,
   onProgress?: (progressText: string, current: number, total?: number) => void,
@@ -290,10 +328,6 @@ export async function readDirectoryRecursivelyNative(
     const normalizedDir = normalizeNativeUri(dirUri);
     if (visitedDirs.has(normalizedDir)) return collectedAssets;
     visitedDirs.add(normalizedDir);
-
-    if (visitedDirs.size === 1) {
-      Alert.alert("Ruta Recibida (Recursiva)", String(dirUri));
-    }
 
     if (normalizedDir.startsWith('content://')) {
       const items = await FileSystem.StorageAccessFramework.readDirectoryAsync(normalizedDir);
@@ -311,16 +345,23 @@ export async function readDirectoryRecursivelyNative(
           if (isAudioExt) {
             const info = await FileSystem.getInfoAsync(itemUri).catch(() => null);
             collectedAssets.push({
-              uri: itemUri,
+              // Conservamos la URI SAF como origen sólo para poder migrar registros antiguos.
+              // La pista indexada usa file:// siempre que el Document ID sea resoluble.
+              uri: sanitizeTrackUriForPlayback(itemUri),
+              sourceUri: itemUri,
               filename: decodeURIComponentSafe(rawFilename),
               mediaType: 'audio',
               duration: 180,
               size: (info as any)?.size || 0
             });
           } else {
-            const info = await FileSystem.getInfoAsync(itemUri).catch(() => null);
-            if (info && info.isDirectory) {
+            // getInfoAsync no informa isDirectory de forma fiable para hijos SAF. Intentamos
+            // explícitamente abrir el documento como directorio para cubrir Artista/Álbum.
+            try {
+              await FileSystem.StorageAccessFramework.readDirectoryAsync(itemUri);
               await readDirectoryRecursivelyNative(itemUri, onProgress, collectedAssets, visitedDirs);
+            } catch {
+              // Es un archivo no musical o un proveedor que no expone la carpeta; se omite.
             }
           }
         } catch (subErr) {
@@ -346,7 +387,8 @@ export async function readDirectoryRecursivelyNative(
             const isAudioExt = ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'dsd', 'dff', 'dsf'].includes(ext);
             if (isAudioExt) {
               collectedAssets.push({
-                uri: itemPath,
+                uri: sanitizeTrackUriForPlayback(itemPath),
+                sourceUri: itemPath,
                 filename: rawFilename,
                 mediaType: 'audio',
                 duration: 180,
@@ -417,9 +459,66 @@ export async function selectManualMusicFolder(): Promise<string | null> {
   return null;
 }
 
+async function resolvePlayableAssetUri(asset: any): Promise<string> {
+  const sourceUri = asset?.sourceUri || asset?.uri || asset?.localUri || '';
+  const directUri = sanitizeTrackUriForPlayback(sourceUri);
+  const needsMediaLibraryLookup = sourceUri.startsWith('content://') && Boolean(asset?.id) && !directUri.startsWith('file://');
+
+  if (directUri && !isUnresolvedSafUri(directUri) && !needsMediaLibraryLookup) {
+    return directUri;
+  }
+
+  // MediaLibrary puede entregar localUri para activos indexados por Android. Se prioriza sobre
+  // content:// para que TrackPlayer y jsmediatags reciban una ruta local cuando esté disponible.
+  if (asset?.id) {
+    try {
+      const info: any = await MediaLibrary.getAssetInfoAsync(asset.id);
+      const resolvedInfoUri = info?.localUri || info?.uri || '';
+      const playableUri = sanitizeTrackUriForPlayback(resolvedInfoUri);
+      if (playableUri && !isUnresolvedSafUri(playableUri)) {
+        return playableUri;
+      }
+    } catch (error) {
+      console.warn('[LibraryService] No se pudo resolver localUri de MediaLibrary:', error);
+    }
+  }
+
+  return directUri;
+}
+
+async function resolveScannedAssets(allAssets: any[]): Promise<any[]> {
+  const resolvedAssets: any[] = [];
+  const BATCH_SIZE = 20;
+
+  for (let index = 0; index < allAssets.length; index += BATCH_SIZE) {
+    const batch = await Promise.all(allAssets.slice(index, index + BATCH_SIZE).map(async (asset) => ({
+      ...asset,
+      sourceUri: asset.sourceUri || asset.uri,
+      uri: await resolvePlayableAssetUri(asset),
+    })));
+    resolvedAssets.push(...batch);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+
+  return resolvedAssets;
+}
+
+export async function scanDeviceAudioFiles(
+  onProgress?: (progressText: string, currentCount: number, totalCount?: number) => void
+): Promise<Track[]> {
+  return scanLocalAudioFiles(onProgress);
+}
+
+export async function scanManualMusicFolder(
+  onProgress?: (progressText: string, currentCount: number, totalCount?: number) => void,
+  customFolderUri?: string
+): Promise<Track[]> {
+  return scanLocalAudioFiles(onProgress, customFolderUri, true);
+}
+
 /**
- * Escanea la biblioteca local leyendo la carpeta manual elegida o MediaLibrary.
- * Fluido, silencioso y seguro contra errores undefined is not a function en metadatos.
+ * Escanea MediaLibrary globalmente por defecto. El modo manual sólo entra cuando la UI solicita
+ * explícitamente SAF, evitando que un permiso concedido abra siempre el selector de carpetas.
  */
 export async function scanLocalAudioFiles(
   onProgress?: (progressText: string, currentCount: number, totalCount?: number) => void,
@@ -438,8 +537,7 @@ export async function scanLocalAudioFiles(
 
     let targetFolderUri: string | undefined = customFolderUri;
 
-    // Si se pide obligatoriamente abrir el selector, o estamos en Android y no tenemos carpeta asignada
-    if (forceManualSelection || (Platform.OS === 'android' && !targetFolderUri && customFolderUri === 'SELECT_FOLDER')) {
+    if (forceManualSelection) {
       if (onProgress) onProgress('Abriendo selector de carpetas de tu dispositivo...', 0);
       const selectedUri = await selectManualMusicFolder();
       if (selectedUri) {
@@ -452,11 +550,6 @@ export async function scanLocalAudioFiles(
         } else {
           return await getCachedTracks();
         }
-      }
-    } else if (!targetFolderUri) {
-      const savedUri = await getPersistedFolderUri();
-      if (savedUri) {
-        targetFolderUri = savedUri;
       }
     }
 
@@ -491,8 +584,10 @@ export async function scanLocalAudioFiles(
       }
     }
 
-    const validAssets = allAssets.filter(asset => {
-      const rawName = asset.filename || asset.uri || '';
+    const resolvedAssets = await resolveScannedAssets(allAssets);
+
+    const validAssets = resolvedAssets.filter(asset => {
+      const rawName = asset.filename || asset.sourceUri || asset.uri || '';
       const cleanNameLower = decodeURIComponentSafe(rawName).toLowerCase();
       const isAudioExt = AUDIO_EXTENSIONS_REGEX.test(cleanNameLower) || ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'dsd', 'dff', 'dsf'].some(ext => cleanNameLower.endsWith(`.${ext}`)) || asset.mediaType === 'audio';
       const hasValidDuration = !asset.duration || asset.duration >= 3;
@@ -503,18 +598,29 @@ export async function scanLocalAudioFiles(
 
     const newAssetsToInsert: any[] = [];
     const activeAssetUris = new Set<string>();
+    const migratedIds = new Set<string>();
 
     for (const asset of validAssets) {
       activeAssetUris.add(asset.uri);
-      if (!cachedIds.has(asset.uri)) {
-        newAssetsToInsert.push(asset);
+      if (cachedIds.has(asset.uri)) continue;
+
+      const sourceUri = asset.sourceUri || asset.uri;
+      if (sourceUri !== asset.uri && cachedIds.has(sourceUri)) {
+        const migrated = await updateTrackUri(sourceUri, asset.uri);
+        if (migrated) {
+          cachedIds.add(asset.uri);
+          migratedIds.add(sourceUri);
+          continue;
+        }
       }
+
+      newAssetsToInsert.push(asset);
     }
 
     if (activeAssetUris.size > 0 && cachedTracks.length > 0) {
       const deletedIds: string[] = [];
       for (const track of cachedTracks) {
-        if (!activeAssetUris.has(track.id)) {
+        if (!activeAssetUris.has(track.id) && !migratedIds.has(track.id)) {
           deletedIds.push(track.id);
         }
       }
