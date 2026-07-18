@@ -9,7 +9,9 @@ import {
   HeartHandshake,
   Settings,
   Code,
+  ListMusic,
 } from 'lucide-react-native';
+import { useTheme } from '../context/ThemeContext';
 
 interface SidebarProps {
   isOpen: boolean;
@@ -29,6 +31,7 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { id: 'home', label: 'Inicio', icon: Home },
   { id: 'library', label: 'Biblioteca', icon: Library },
+  { id: 'playlists', label: 'Playlists', icon: ListMusic },
   { id: 'artistas', label: 'Artistas', icon: Clock },
   { id: 'álbumes', label: 'Álbumes', icon: LayoutGrid },
   { id: 'donate', label: 'Donar', icon: HeartHandshake, showProgress: true },
@@ -45,6 +48,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   activeTab,
   onSelectTab,
 }) => {
+  const { colors } = useTheme();
   if (!isOpen) {
     return null;
   }
@@ -90,7 +94,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           bottom: 0,
           left: 0,
           width: 280,
-          backgroundColor: '#0F1011',
+          backgroundColor: colors.background,
           paddingTop: 56,
           paddingBottom: 32,
           paddingHorizontal: 20,
@@ -110,13 +114,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 32, paddingHorizontal: 4 }}>
             <Image
               source={require('../assets/logo.png')}
-              style={{ width: 36, height: 36, resizeMode: 'contain', marginRight: 12, tintColor: '#FFFFFF' }}
+              style={{ width: 36, height: 36, resizeMode: 'contain', marginRight: 12, tintColor: colors.foreground }}
             />
             <Text
               style={{
                 fontSize: 22,
                 fontWeight: '800',
-                color: '#FFFFFF',
+                color: colors.foreground,
                 letterSpacing: 0.5,
               }}
             >
@@ -140,19 +144,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       paddingVertical: 12,
                       paddingHorizontal: 16,
                       borderRadius: 12,
-                      backgroundColor: isActive ? '#B43C12' : 'transparent',
+                      backgroundColor: isActive ? colors.primary : 'transparent',
                     }}
                   >
                     <item.icon
                       size={20}
-                      color={isActive ? '#FFFFFF' : '#D1D5DB'}
+                      color={isActive ? colors.primaryForeground : colors.mutedForeground}
                       style={{ marginRight: 14 }}
                     />
                     <Text
                       style={{
                         fontSize: 16,
                         fontWeight: isActive ? '700' : '500',
-                        color: isActive ? '#FFFFFF' : '#D1D5DB',
+                        color: isActive ? colors.primaryForeground : colors.foreground,
                         letterSpacing: -0.2,
                       }}
                     >

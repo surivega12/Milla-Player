@@ -1,10 +1,11 @@
 """
 Django settings for vertex_cloud project (Ecosistema VERTEX - MILLAY).
 
-Backend de cálculos pesados audiófilos (Letras sincronizadas LRC, Librosa BPM/Key, y Spleeter).
+Backend de calculos pesados de audio (letras sincronizadas, BPM, clave y transiciones con Librosa).
 """
 import os
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management.utils import get_random_secret_key
 
@@ -27,7 +28,7 @@ if not SECRET_KEY:
         raise ImproperlyConfigured('DJANGO_SECRET_KEY debe configurarse en producción.')
     SECRET_KEY = get_random_secret_key()
 
-DEBUG = os.environ.get('DJANGO_DEBUG', 'false' if IS_PRODUCTION else 'true').lower() in ('true', '1', 'yes')
+DEBUG = False if IS_PRODUCTION else os.environ.get('DJANGO_DEBUG', 'true').lower() in ('true', '1', 'yes')
 
 ALLOWED_HOSTS = env_list(
     'DJANGO_ALLOWED_HOSTS',
@@ -86,21 +87,57 @@ WSGI_APPLICATION = 'vertex_cloud.wsgi.application'
 ASGI_APPLICATION = 'vertex_cloud.asgi.application'
 
 
-# Database - Punto 2.1: PostgreSQL con caché, fallback a SQLite en desarrollo local
+# Database - PostgreSQL in hosted environments, SQLite for local development.
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
 
-if os.environ.get('POSTGRES_DB') or os.environ.get('DATABASE_URL'):
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+POSTGRES_DB = os.environ.get('POSTGRES_DB', '').strip()
+
+if DATABASE_URL:
+    parsed_database_url = urlparse(DATABASE_URL)
+    if parsed_database_url.scheme not in {'postgres', 'postgresql'}:
+        raise ImproperlyConfigured('DATABASE_URL debe usar postgres:// o postgresql://.')
+
+    database_name = unquote(parsed_database_url.path.lstrip('/'))
+    if not database_name:
+        raise ImproperlyConfigured('DATABASE_URL debe incluir el nombre de la base de datos.')
+
+    database_query = parse_qs(parsed_database_url.query)
+    database_options = {'connect_timeout': 10}
+    ssl_mode = database_query.get('sslmode', [os.environ.get('POSTGRES_SSLMODE', '')])[0]
+    if not ssl_mode and IS_PRODUCTION:
+        ssl_mode = 'require'
+    if ssl_mode:
+        database_options['sslmode'] = ssl_mode
+
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.postgresql',
-            'NAME': os.environ.get('POSTGRES_DB', 'vertex_cloud'),
+            'NAME': database_name,
+            'USER': unquote(parsed_database_url.username or ''),
+            'PASSWORD': unquote(parsed_database_url.password or ''),
+            'HOST': parsed_database_url.hostname or 'localhost',
+            'PORT': str(parsed_database_url.port or 5432),
+            'CONN_MAX_AGE': int(os.environ.get('POSTGRES_CONN_MAX_AGE', '60')),
+            'OPTIONS': database_options,
+        }
+    }
+elif POSTGRES_DB:
+    database_options = {'connect_timeout': 10}
+    ssl_mode = os.environ.get('POSTGRES_SSLMODE', 'require' if IS_PRODUCTION else '').strip()
+    if ssl_mode:
+        database_options['sslmode'] = ssl_mode
+
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': POSTGRES_DB,
             'USER': os.environ.get('POSTGRES_USER', 'postgres'),
-            'PASSWORD': os.environ.get('POSTGRES_PASSWORD', 'postgres'),
+            'PASSWORD': os.environ.get('POSTGRES_PASSWORD', ''),
             'HOST': os.environ.get('POSTGRES_HOST', 'localhost'),
             'PORT': os.environ.get('POSTGRES_PORT', '5432'),
-            'OPTIONS': {
-                'connect_timeout': 10,
-            }
+            'CONN_MAX_AGE': int(os.environ.get('POSTGRES_CONN_MAX_AGE', '60')),
+            'OPTIONS': database_options,
         }
     }
 else:
@@ -167,6 +204,16 @@ CORS_ALLOW_HEADERS = [
     'x-csrftoken',
     'x-requested-with',
 ]
+
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = 'DENY'
+SESSION_COOKIE_SECURE = IS_PRODUCTION
+CSRF_COOKIE_SECURE = IS_PRODUCTION
+SECURE_SSL_REDIRECT = IS_PRODUCTION
+SECURE_HSTS_SECONDS = 31536000 if IS_PRODUCTION else 0
+SECURE_HSTS_INCLUDE_SUBDOMAINS = IS_PRODUCTION
+SECURE_HSTS_PRELOAD = IS_PRODUCTION
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https') if IS_PRODUCTION else None
 
 # Configuración Django REST Framework
 REST_FRAMEWORK = {

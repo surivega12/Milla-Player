@@ -56,7 +56,13 @@ function getArtworkFallback(track: Track) {
   };
 }
 
-const TrackArtwork = React.memo(({ track }: { track: Track }) => {
+const TrackArtwork = React.memo(({
+  track,
+  onArtworkError,
+}: {
+  track: Track;
+  onArtworkError: (trackId: string) => void;
+}) => {
   const imageUrl = track.artwork_thumb || track.artwork;
   const fallback = getArtworkFallback(track);
   const [failed, setFailed] = useState(false);
@@ -69,7 +75,10 @@ const TrackArtwork = React.memo(({ track }: { track: Track }) => {
         source={{ uri: imageUrl }}
         style={StyleSheet.absoluteFill}
         resizeMode="cover"
-        onError={() => setFailed(true)}
+        onError={() => {
+          setFailed(true);
+          onArtworkError(track.id);
+        }}
       />
     );
   }
@@ -110,6 +119,9 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
   const [sortBy, setSortBy] = useState<SortOption>('title');
   const [filterLosslessOnly, setFilterLosslessOnly] = useState<boolean>(false);
   const artworkRequestsRef = useRef<Set<string>>(new Set());
+  const artworkFailureCountsRef = useRef<Map<string, number>>(new Map());
+  const visibleTrackIdsRef = useRef<Set<string>>(new Set());
+  const [visibleRevision, setVisibleRevision] = useState(0);
 
   const scrollY = useSharedValue(0);
   const headerTranslationY = useSharedValue(0);
@@ -168,14 +180,18 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
     let cancelled = false;
     const candidates = localTracks.filter((track) => {
       const hasArtwork = Boolean(track.artwork_thumb || track.artwork);
-      return !hasArtwork && Boolean(track.url || track.id) && !artworkRequestsRef.current.has(track.id);
-    });
+      return visibleTrackIdsRef.current.has(track.id) &&
+        !hasArtwork &&
+        Boolean(track.url || track.id) &&
+        !artworkRequestsRef.current.has(track.id);
+    }).slice(0, 16);
 
     if (candidates.length === 0) return () => { cancelled = true; };
     candidates.forEach((track) => artworkRequestsRef.current.add(track.id));
 
     const hydrateArtwork = async () => {
       const BATCH_SIZE = 2;
+      const hydratedTracks: Track[] = [];
 
       for (let index = 0; index < candidates.length && !cancelled; index += BATCH_SIZE) {
         const batch = candidates.slice(index, index + BATCH_SIZE);
@@ -198,15 +214,16 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
         const foundArtwork = results.filter(
           (track): track is NonNullable<typeof track> => track !== null
         );
-        if (foundArtwork.length > 0 && !cancelled) {
-          const byId = new Map(foundArtwork.map((track) => [track.id, track]));
-          setLocalTracks((current) => current.map((track) => byId.get(track.id) || track));
-          await insertTracks(foundArtwork).catch((error) => {
-            console.warn('No se pudieron persistir las caratulas extraidas:', error);
-          });
-        }
+        hydratedTracks.push(...foundArtwork);
       }
 
+      if (hydratedTracks.length > 0 && !cancelled) {
+        const byId = new Map(hydratedTracks.map((track) => [track.id, track]));
+        setLocalTracks((current) => current.map((track) => byId.get(track.id) || track));
+        await insertTracks(hydratedTracks).catch((error) => {
+          console.warn('No se pudieron persistir las caratulas extraidas:', error);
+        });
+      }
     };
 
     const interaction = InteractionManager.runAfterInteractions(hydrateArtwork);
@@ -214,7 +231,17 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
       cancelled = true;
       interaction.cancel();
     };
-  }, [localTracks]);
+  }, [localTracks, visibleRevision]);
+
+  const onViewableItemsChanged = useRef(({ viewableItems }: { viewableItems: Array<{ item?: Track }> }) => {
+    const nextIds = new Set(viewableItems.map((entry) => entry.item?.id).filter((id): id is string => Boolean(id)));
+    const previousIds = visibleTrackIdsRef.current;
+    const changed = nextIds.size !== previousIds.size || [...nextIds].some((id) => !previousIds.has(id));
+    if (changed) {
+      visibleTrackIdsRef.current = nextIds;
+      setVisibleRevision((value) => value + 1);
+    }
+  }).current;
 
   const handleRefresh = async () => {
     setIsRefreshing(true);
@@ -269,6 +296,17 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
     [onSelectTrack]
   );
 
+  const handleArtworkError = useCallback((trackId: string) => {
+    const failures = (artworkFailureCountsRef.current.get(trackId) || 0) + 1;
+    artworkFailureCountsRef.current.set(trackId, failures);
+    if (failures <= 1) artworkRequestsRef.current.delete(trackId);
+    setLocalTracks((current) => current.map((track) =>
+      track.id === trackId
+        ? { ...track, artwork: undefined, artwork_thumb: undefined }
+        : track
+    ));
+  }, []);
+
   const renderFilterBadge = (option: SortOption, label: string, icon: React.ReactNode) => {
     const isActive = sortBy === option;
     return (
@@ -315,7 +353,7 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
         >
           {/* Carátula (Extremo Izquierdo) */}
           <View style={{ width: 53, height: 53 }} className="rounded-md overflow-hidden bg-neutral-900 border border-white/5 mr-3 relative">
-            <TrackArtwork track={item} />
+            <TrackArtwork track={item} onArtworkError={handleArtworkError} />
             {/* Indicador de Reproducción Actual */}
             {isCurrent && (
               <View className="absolute inset-0 bg-black/50 items-center justify-center">
@@ -344,7 +382,10 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
 
           {/* Opciones (Extremo Derecho) */}
           <TouchableOpacity
-            onPress={() => setSelectedTrackForOptions(item)}
+            onPress={(event) => {
+              event.stopPropagation();
+              setSelectedTrackForOptions(item);
+            }}
             hitSlop={{ top: 15, bottom: 15, left: 15, right: 15 }}
             className="p-2 ml-2"
           >
@@ -353,7 +394,7 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
         </TouchableOpacity>
       );
     },
-    [currentTrackId, colors, handleCardPress]
+    [currentTrackId, colors, handleArtworkError, handleCardPress]
   );
 
   const renderListHeader = () => (
@@ -406,8 +447,10 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
             ListHeaderComponent={renderListHeader}
             onScroll={scrollHandler}
             scrollEventThrottle={16}
-            {...({ estimatedItemSize: 240 } as any)}
+            {...({ estimatedItemSize: 69 } as any)}
             numColumns={COLUMN_COUNT}
+            onViewableItemsChanged={onViewableItemsChanged}
+            viewabilityConfig={{ itemVisiblePercentThreshold: 20, minimumViewTime: 120 }}
             contentContainerStyle={{ paddingBottom: 130 }}
             showsVerticalScrollIndicator={false}
             keyExtractor={(item: any) => item.id}

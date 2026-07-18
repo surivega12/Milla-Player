@@ -170,7 +170,6 @@ async function findAndLinkLyricsNative(asset: any): Promise<string | null> {
         if (lrcInfo && lrcInfo.exists && !lrcInfo.isDirectory) {
           const content = await FileSystem.readAsStringAsync(lrcInfo.uri || lrcPathRaw, { encoding: FileSystem.EncodingType.UTF8 });
           if (content && content.trim().length > 0) {
-            console.log(`[LibraryService] Letra LRC vinculada con éxito para: ${baseName}`);
             return content.trim();
           }
         }
@@ -182,7 +181,6 @@ async function findAndLinkLyricsNative(asset: any): Promise<string | null> {
         if (txtInfo && txtInfo.exists && !txtInfo.isDirectory) {
           const content = await FileSystem.readAsStringAsync(txtInfo.uri || txtPathRaw, { encoding: FileSystem.EncodingType.UTF8 });
           if (content && content.trim().length > 0) {
-            console.log(`[LibraryService] Letra TXT vinculada con éxito para: ${baseName}`);
             return content.trim();
           }
         }
@@ -509,6 +507,58 @@ export async function scanDeviceAudioFiles(
   return scanLocalAudioFiles(onProgress);
 }
 
+export async function refreshLocalTrackMetadata(
+  onProgress?: (current: number, total: number, title: string) => void
+): Promise<{ updated: number; failed: number; total: number }> {
+  if (Platform.OS === 'web') return { updated: 0, failed: 0, total: 0 };
+  const tracks = await getCachedTracks();
+  const localTracks = tracks.filter((track) => !String(track.url || '').startsWith('http'));
+  let updated = 0;
+  let failed = 0;
+  let pendingBatch: Track[] = [];
+
+  for (let index = 0; index < localTracks.length; index++) {
+    const track = localTracks[index];
+    onProgress?.(index + 1, localTracks.length, track.title);
+    try {
+      const uri = sanitizeTrackUriForPlayback(track.url || track.id);
+      if (!uri || isUnresolvedSafUri(uri)) throw new Error('URI_NOT_READABLE');
+      const metadata = await extractMetadata(uri, track.id);
+      const title = metadata.title || track.title;
+      const artist = metadata.artist || track.artist;
+      pendingBatch.push({
+        ...track,
+        url: uri,
+        title,
+        artist,
+        album: metadata.album || track.album,
+        duration: Math.round(metadata.duration || track.duration || 0),
+        artwork: metadata.artwork_thumb || track.artwork,
+        artwork_thumb: metadata.artwork_thumb || track.artwork_thumb,
+        bpm: metadata.bpm ?? track.bpm,
+        key: metadata.key || track.key,
+        replayGainTrack: metadata.replayGainTrack ?? track.replayGainTrack,
+        replayGainAlbum: metadata.replayGainAlbum ?? track.replayGainAlbum,
+        lyrics_ttml: metadata.lyrics_ttml || track.lyrics_ttml,
+        lyrics_lrc: metadata.lyrics_lrc || track.lyrics_lrc,
+        lyrics_plain: metadata.lyrics_plain || track.lyrics_plain,
+        lyrics_source: metadata.lyrics_source || track.lyrics_source,
+        needs_repair: !title || !artist || /unknown|desconocido/i.test(artist),
+      });
+      updated++;
+    } catch {
+      failed++;
+    }
+
+    if (pendingBatch.length >= 8 || index === localTracks.length - 1) {
+      if (pendingBatch.length) await insertTracks(pendingBatch);
+      pendingBatch = [];
+      await new Promise<void>((resolve) => setTimeout(resolve, 16));
+    }
+  }
+  return { updated, failed, total: localTracks.length };
+}
+
 export async function scanManualMusicFolder(
   onProgress?: (progressText: string, currentCount: number, totalCount?: number) => void,
   customFolderUri?: string
@@ -649,7 +699,7 @@ export async function scanLocalAudioFiles(
           try {
             let meta: any = {};
             try {
-              meta = await extractMetadata(asset.uri, asset.uri);
+              meta = await extractMetadata(asset.uri, asset.uri, false);
             } catch (metaErr) {
               meta = {};
             }
@@ -669,6 +719,9 @@ export async function scanLocalAudioFiles(
             let thumbUri = meta.artwork_thumb;
 
             const linkedLyrics = await findAndLinkLyricsNative(asset);
+            const embeddedLyricsLrc = meta.lyrics_lrc || undefined;
+            const effectiveLyricsLrc = embeddedLyricsLrc || linkedLyrics || undefined;
+            const lyricsSource = meta.lyrics_source || (linkedLyrics ? 'companion_lrc' : undefined);
 
             batchTracks.push({
               id: asset.uri,
@@ -685,8 +738,11 @@ export async function scanLocalAudioFiles(
               replayGainTrack: meta.replayGainTrack,
               replayGainAlbum: meta.replayGainAlbum,
               needs_repair: needsRepair as any,
-              lyrics_lrc: linkedLyrics || undefined,
-              lyrics: linkedLyrics || undefined,
+              lyrics_lrc: effectiveLyricsLrc,
+              lyrics_ttml: meta.lyrics_ttml || undefined,
+              lyrics_plain: meta.lyrics_plain || undefined,
+              lyrics_source: lyricsSource,
+              lyrics: effectiveLyricsLrc || meta.lyrics_plain || undefined,
             });
           } catch (trackErr: any) {
             // Si el procesamiento individual falla por cualquier circunstancia, creamos una pista de respaldo

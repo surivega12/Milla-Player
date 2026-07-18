@@ -22,7 +22,9 @@ import {
   createLocalBackup,
   restoreLocalBackup,
   listLocalBackups,
+  optimizeDatabase,
 } from '../services/database-service';
+import { refreshLocalTrackMetadata } from '../services/library-service';
 import { globalVertexQueueManager } from '../services/queue-service';
 import Animated, {
   useSharedValue,
@@ -47,6 +49,7 @@ import {
   FileText,
 } from 'lucide-react-native';
 import { AnimatedHeader } from '../components/AnimatedHeader';
+import { useTheme } from '../context/ThemeContext';
 
 const AnimatedScrollView = Animated.createAnimatedComponent(ScrollView);
 
@@ -60,6 +63,8 @@ export interface SettingsScreenProps {
   onSelectAudioQuality: (quality: 'hires' | 'hq' | 'standard') => void;
   onClearCache: () => void;
   cacheSize: string;
+  onAutoMixEnabledChange?: (enabled: boolean) => void;
+  onLibraryChanged?: () => Promise<void> | void;
 }
 
 interface SettingRowItem {
@@ -94,7 +99,10 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   onSelectAudioQuality,
   onClearCache,
   cacheSize,
+  onAutoMixEnabledChange,
+  onLibraryChanged,
 }) => {
+  const { colors } = useTheme();
   const headerTranslationY = useSharedValue(0);
   const [activeModal, setActiveModal] = useState<string | null>(null);
 
@@ -102,14 +110,16 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     enabled: false,
     bpm_tolerance: 5,
     harmonic_mode: 'free',
-    crossfade_seconds: 0,
-    cross_out_enabled: false,
+    crossfade_seconds: 6,
+    cross_out_enabled: true,
     equalizer_preset: 'flat',
   });
 
   const [notificationEnabled, setNotificationEnabled] = useState<boolean>(true);
   const [localBackups, setLocalBackups] = useState<{ name: string; uri: string; size?: number }[]>([]);
   const [backupStatusMsg, setBackupStatusMsg] = useState<string>('');
+  const [advancedTask, setAdvancedTask] = useState<'metadata' | 'database' | null>(null);
+  const [advancedProgress, setAdvancedProgress] = useState<string>('');
 
   useEffect(() => {
     let isMounted = true;
@@ -142,8 +152,9 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     setAutoMixSettings(updated);
     await saveAutoMixSettings(updated);
     if (typeof globalVertexQueueManager?.syncSettings === 'function') {
-      globalVertexQueueManager.syncSettings();
+      await globalVertexQueueManager.syncSettings();
     }
+    if (partial.enabled !== undefined) onAutoMixEnabledChange?.(partial.enabled);
   };
 
   const handleToggleNotification = async (newVal: boolean) => {
@@ -166,6 +177,34 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     } catch (err) {
       console.log('[Settings] Notificación local actualizada:', err);
     }
+  };
+
+  const handleRefreshMetadata = async () => {
+    if (advancedTask) return;
+    setAdvancedTask('metadata');
+    setAdvancedProgress('Preparando archivos locales...');
+    try {
+      const result = await refreshLocalTrackMetadata((current, total, title) => {
+        setAdvancedProgress(`${current}/${total}: ${title}`);
+      });
+      await onLibraryChanged?.();
+      Alert.alert('Metadatos ID3', `${result.updated} pistas actualizadas y ${result.failed} pendientes.`);
+    } catch (error) {
+      Alert.alert('Metadatos ID3', 'No se pudo completar la lectura de etiquetas locales.');
+    } finally {
+      setAdvancedTask(null);
+      setAdvancedProgress('');
+    }
+  };
+
+  const handleOptimizeDatabase = async () => {
+    if (advancedTask) return;
+    setAdvancedTask('database');
+    setAdvancedProgress('Compactando SQLite...');
+    const success = await optimizeDatabase();
+    setAdvancedTask(null);
+    setAdvancedProgress('');
+    Alert.alert('SQLite', success ? 'Base de datos optimizada correctamente.' : 'No se pudo optimizar la base de datos.');
   };
 
   const openSystemEqualizer = async () => {
@@ -368,7 +407,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   );
 
   return (
-    <View style={{ flex: 1, backgroundColor: '#000000' }}>
+    <View style={{ flex: 1, backgroundColor: colors.background }}>
       <AnimatedHeader
         title="Configuración"
         headerTranslationY={headerTranslationY}
@@ -401,7 +440,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         onRequestClose={() => setActiveModal(null)}
       >
         <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
+          <View style={[styles.modalContent, { backgroundColor: colors.card, borderColor: colors.border }]}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Audio y Reproducción DJ</Text>
               <TouchableOpacity onPress={() => setActiveModal(null)} style={styles.closeBtn}>
@@ -504,7 +543,8 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                     maximumValue={12}
                     step={1}
                     value={autoMixSettings.crossfade_seconds}
-                    onValueChange={(val) => updateAndSaveAutoMixSetting({ crossfade_seconds: val })}
+                    onValueChange={(val) => setAutoMixSettings((current) => ({ ...current, crossfade_seconds: val }))}
+                    onSlidingComplete={(val) => updateAndSaveAutoMixSetting({ crossfade_seconds: val })}
                     minimumTrackTintColor="#B43C12"
                     maximumTrackTintColor="#262626"
                     thumbTintColor="#FFFFFF"
@@ -624,7 +664,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         onRequestClose={() => setActiveModal(null)}
       >
         <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
+          <View style={[styles.modalContent, { backgroundColor: colors.card, borderColor: colors.border }]}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Tema y Colores</Text>
               <TouchableOpacity onPress={() => setActiveModal(null)} style={styles.closeBtn}>
@@ -664,7 +704,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         onRequestClose={() => setActiveModal(null)}
       >
         <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
+          <View style={[styles.modalContent, { backgroundColor: colors.card, borderColor: colors.border }]}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Otras Configuraciones y Caché</Text>
               <TouchableOpacity onPress={() => setActiveModal(null)} style={styles.closeBtn}>
@@ -695,16 +735,19 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               <Text style={[styles.sectionHeader, { marginTop: 24 }]}>Herramientas Avanzadas</Text>
               <View style={styles.infoRow}>
                 <Text style={{ color: '#d1d5db', fontSize: 14 }}>Forzar resincronización de metadatos ID3</Text>
-                <TouchableOpacity style={styles.smallActionBtn} onPress={() => Alert.alert('Listo', 'Metadatos sincronizados correctamente.')}>
-                  <Text style={{ color: '#fff', fontSize: 12, fontWeight: '600' }}>Ejecutar</Text>
+                <TouchableOpacity style={styles.smallActionBtn} disabled={Boolean(advancedTask)} onPress={() => void handleRefreshMetadata()}>
+                  <Text style={{ color: '#fff', fontSize: 12, fontWeight: '600' }}>{advancedTask === 'metadata' ? 'Leyendo...' : 'Ejecutar'}</Text>
                 </TouchableOpacity>
               </View>
               <View style={styles.infoRow}>
                 <Text style={{ color: '#d1d5db', fontSize: 14 }}>Optimizar base de datos de audio SQLite</Text>
-                <TouchableOpacity style={styles.smallActionBtn} onPress={() => Alert.alert('Listo', 'Base de datos compactada.')}>
-                  <Text style={{ color: '#fff', fontSize: 12, fontWeight: '600' }}>Optimizar</Text>
+                <TouchableOpacity style={styles.smallActionBtn} disabled={Boolean(advancedTask)} onPress={() => void handleOptimizeDatabase()}>
+                  <Text style={{ color: '#fff', fontSize: 12, fontWeight: '600' }}>{advancedTask === 'database' ? 'Procesando...' : 'Optimizar'}</Text>
                 </TouchableOpacity>
               </View>
+              {advancedProgress ? (
+                <Text style={{ color: '#9ca3af', fontSize: 12, marginTop: 10 }} numberOfLines={2}>{advancedProgress}</Text>
+              ) : null}
             </View>
           </View>
         </View>
@@ -718,7 +761,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         onRequestClose={() => setActiveModal(null)}
       >
         <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
+          <View style={[styles.modalContent, { backgroundColor: colors.card, borderColor: colors.border }]}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Acerca de Milla</Text>
               <TouchableOpacity onPress={() => setActiveModal(null)} style={styles.closeBtn}>
@@ -763,7 +806,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         onRequestClose={() => setActiveModal(null)}
       >
         <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
+          <View style={[styles.modalContent, { backgroundColor: colors.card, borderColor: colors.border }]}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Estilo de Notificación Local</Text>
               <TouchableOpacity onPress={() => setActiveModal(null)} style={styles.closeBtn}>
@@ -804,7 +847,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         onRequestClose={() => setActiveModal(null)}
       >
         <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
+          <View style={[styles.modalContent, { backgroundColor: colors.card, borderColor: colors.border }]}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Respaldo y Restauración</Text>
               <TouchableOpacity onPress={() => setActiveModal(null)} style={styles.closeBtn}>
@@ -880,7 +923,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         onRequestClose={() => setActiveModal(null)}
       >
         <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
+          <View style={[styles.modalContent, { backgroundColor: colors.card, borderColor: colors.border }]}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Personalizar Interfaz</Text>
               <TouchableOpacity onPress={() => setActiveModal(null)} style={styles.closeBtn}>

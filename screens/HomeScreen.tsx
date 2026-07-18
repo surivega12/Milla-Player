@@ -14,6 +14,7 @@ import {
   BackHandler,
 } from 'react-native';
 import Animated, { useSharedValue, useAnimatedScrollHandler } from 'react-native-reanimated';
+import { FlashList } from '@shopify/flash-list';
 import { AnimatedHeader } from '../components/AnimatedHeader';
 import {
   Search,
@@ -43,6 +44,7 @@ import { NotificationCard } from '../components/NotificationCard';
 import { useVertexQueue } from '../services/queue-service';
 import { playPlaylist } from '../services/audio-service';
 import { getTracksByGenre, getForgottenTracks, getTracksByEmotion } from '../services/database-service';
+import { getThemeColors } from '../utils/theme-colors';
 
 const { width } = Dimensions.get('window');
 
@@ -64,6 +66,7 @@ interface HomeScreenProps {
   onDownloadTrack: (track: Track) => void;
   onOptimize?: () => void;
   isOptimizing?: boolean;
+  optimizationProgressText?: string;
   onNavigateToArtists?: () => void;
 }
 
@@ -85,8 +88,10 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   onDownloadTrack,
   onOptimize,
   isOptimizing = false,
+  optimizationProgressText,
   onNavigateToArtists,
 }) => {
+  const colors = getThemeColors(currentTheme);
   const [activeSubScreen, setActiveSubScreen] = useState<SubScreenType>('home');
   const [isEmotionModalOpen, setIsEmotionModalOpen] = useState<boolean>(false);
   const { setCatalog, setSessionAutoMixForced } = useVertexQueue();
@@ -149,7 +154,13 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
   });
 
-  const tracksNeedingRepair = tracks.filter((t) => (t as any).needs_repair).length;
+  const tracksNeedingRepair = tracks.filter((track) =>
+    Boolean(track.needs_repair) ||
+    track.analysis_status !== 'ready' ||
+    !track.bpm ||
+    !track.camelot_key ||
+    !track.outro_duration_ms
+  ).length;
 
   // Helpers de datos para las sub-pantallas
   const getSubScreenTitle = () => {
@@ -173,16 +184,13 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     return 'Hi-Res';
   };
 
-  // Artistas y Álbumes destacados dinámicos o simulados
-  const topArtists =
-    tracks.length > 0
-      ? Array.from(new Set(tracks.map((t) => t.artist).filter((a) => a && a !== 'Unknown Artist'))).slice(0, 8)
-      : ['alleh, Yorghaki', 'Bad Bunny', 'Myke Towers', 'Tito El Bambino', 'Blessd', 'J Balvin'];
+  const topArtists = Array.from(
+    new Set(tracks.map((track) => track.artist).filter((artist) => artist && artist !== 'Unknown Artist'))
+  ).slice(0, 8);
 
-  const topAlbums =
-    tracks.length > 0
-      ? Array.from(new Set(tracks.map((t) => t.album || t.title).filter(Boolean))).slice(0, 8)
-      : ['Loco de Amor', 'DeBÍ TiRAR MáS FOToS', 'capaz (merengueton)', 'Otro Show', 'Verde'];
+  const topAlbums = Array.from(
+    new Set(tracks.map((track) => track.album).filter((album): album is string => Boolean(album)))
+  ).slice(0, 8);
 
   const getArtistArtwork = (artistName: string) => {
     const found = tracks.find((t) => t.artist === artistName && t.artwork);
@@ -214,22 +222,22 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     const subTracks = getSubScreenTracks();
 
     return (
-      <View style={[StyleSheet.absoluteFill, { backgroundColor: '#000000' }]} className="flex-1 bg-black">
+      <View style={[StyleSheet.absoluteFill, { backgroundColor: colors.background }]} className="flex-1">
         {/* Cabecera Negra Sólida con Flecha de Retroceso y Estilo Apple Music */}
-        <View className="flex-row items-center justify-between px-5 pt-14 pb-4 bg-black border-b border-white/10">
+        <View className="flex-row items-center justify-between px-5 pt-14 pb-4 border-b" style={{ backgroundColor: colors.card, borderBottomColor: colors.border }}>
           <TouchableOpacity
             onPress={() => setActiveSubScreen('home')}
             hitSlop={{ top: 15, bottom: 15, left: 15, right: 15 }}
             className="p-1.5"
           >
-            <ArrowLeft size={24} color="#FFFFFF" />
+            <ArrowLeft size={24} color={colors.foreground} />
           </TouchableOpacity>
-          <Text className="text-xl font-extrabold text-white tracking-tight">{getSubScreenTitle()}</Text>
+          <Text className="text-xl font-extrabold" style={{ color: colors.foreground }}>{getSubScreenTitle()}</Text>
           <View className="w-9" />
         </View>
 
         {/* Dos Botones de Acción Rápida Minimalistas (Reproducir translúcido y Aleatorio en contraste) */}
-        <View className="flex-row items-center gap-3.5 px-5 py-4 bg-black border-b border-white/5">
+        <View className="flex-row items-center gap-3.5 px-5 py-4 border-b" style={{ backgroundColor: colors.background, borderBottomColor: colors.border }}>
           {/* Botón Reproducir (Glassmorphism sutil) */}
           <TouchableOpacity
             onPress={() => {
@@ -262,12 +270,13 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         </View>
 
         {/* Lista Compacta de Canciones estilo Apple Music con Badges explícitos / Hi-Res */}
-        <Animated.ScrollView
+        <FlashList
+          data={subTracks}
+          keyExtractor={(track) => track.id}
           showsVerticalScrollIndicator={false}
-          contentContainerStyle={{ paddingBottom: 130, paddingHorizontal: 20 }}
-          className="flex-1 bg-black pt-2"
-        >
-          {subTracks.length === 0 ? (
+          contentContainerStyle={{ paddingBottom: 130, paddingHorizontal: 20, paddingTop: 8 }}
+          style={{ backgroundColor: colors.background }}
+          ListEmptyComponent={(
             <View className="items-center justify-center py-20 px-4">
               <Disc size={52} color="#3F3F46" />
               <Text className="text-white font-bold text-base mt-4 text-center">
@@ -277,55 +286,51 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                 Pulsa en escanear para añadir e indexar tu colección de audio de alta fidelidad.
               </Text>
             </View>
-          ) : (
-            subTracks.map((track) => {
-              const isCurrent = currentTrackId === track.id;
-              const displayArtwork = (track as any).artwork_thumb || track.artwork;
-              const qualityLabel = getTrackQualityLabel(track);
-
-              return (
-                <TouchableOpacity
-                  key={track.id}
-                  onPress={() => onSelectTrack(track)}
-                  activeOpacity={0.8}
-                  className="flex-row items-center justify-between py-3.5 border-b border-white/10"
-                >
-                  <View className="flex-row items-center flex-1 mr-3">
-                    <View className="w-12 h-12 rounded-xl bg-neutral-900 border border-white/10 overflow-hidden mr-3.5 justify-center items-center shadow-sm">
-                      {displayArtwork ? (
-                        <Image source={{ uri: displayArtwork }} className="w-full h-full" resizeMode="cover" />
-                      ) : (
-                        <Disc size={24} color="#6B7280" />
-                      )}
-                    </View>
-                    <View className="flex-1 justify-center">
-                      <View className="flex-row items-center gap-1.5 pr-2">
-                        <Text
-                          className={`text-sm font-semibold tracking-tight truncate flex-1 ${
-                            isCurrent ? 'text-sky-400 font-bold' : 'text-white'
-                          }`}
-                          numberOfLines={1}
-                        >
-                          {track.title}
-                        </Text>
-                        {/* Badge de Calidad / Etiqueta estilo Apple Music [FLAC / Hi-Res / E] */}
-                        <View className="bg-neutral-800 border border-neutral-700/80 px-1.5 py-0.5 rounded flex-row items-center">
-                          <Text className="text-[9px] font-bold text-gray-300 uppercase tracking-wider">
-                            {qualityLabel}
-                          </Text>
-                        </View>
-                      </View>
-                      <Text className="text-xs font-medium text-gray-400 mt-0.5 truncate" numberOfLines={1}>
-                        {track.artist} {track.album ? `• ${track.album}` : ''}
-                      </Text>
-                    </View>
-                  </View>
-                  <View className="w-9" />
-                </TouchableOpacity>
-              );
-            })
           )}
-        </Animated.ScrollView>
+          renderItem={({ item: track }) => {
+            const isCurrent = currentTrackId === track.id;
+            const displayArtwork = track.artwork_thumb || track.artwork;
+            const qualityLabel = getTrackQualityLabel(track);
+            return (
+              <TouchableOpacity
+                onPress={() => onSelectTrack(track)}
+                activeOpacity={0.8}
+                className="flex-row items-center justify-between py-3.5 border-b border-white/10"
+              >
+                <View className="flex-row items-center flex-1 mr-3">
+                  <View className="w-12 h-12 rounded-xl bg-neutral-900 border border-white/10 overflow-hidden mr-3.5 justify-center items-center shadow-sm">
+                    {displayArtwork ? (
+                      <Image source={{ uri: displayArtwork }} className="w-full h-full" resizeMode="cover" />
+                    ) : (
+                      <Disc size={24} color="#6B7280" />
+                    )}
+                  </View>
+                  <View className="flex-1 justify-center">
+                    <View className="flex-row items-center gap-1.5 pr-2">
+                      <Text
+                        className={`text-sm font-semibold tracking-tight truncate flex-1 ${
+                          isCurrent ? 'text-sky-400 font-bold' : 'text-white'
+                        }`}
+                        numberOfLines={1}
+                      >
+                        {track.title}
+                      </Text>
+                      <View className="bg-neutral-800 border border-neutral-700/80 px-1.5 py-0.5 rounded flex-row items-center">
+                        <Text className="text-[9px] font-bold text-gray-300 uppercase tracking-wider">
+                          {qualityLabel}
+                        </Text>
+                      </View>
+                    </View>
+                    <Text className="text-xs font-medium text-gray-400 mt-0.5 truncate" numberOfLines={1}>
+                      {track.artist} {track.album ? `• ${track.album}` : ''}
+                    </Text>
+                  </View>
+                </View>
+                <View className="w-9" />
+              </TouchableOpacity>
+            );
+          }}
+        />
       </View>
     );
   }
@@ -334,7 +339,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   // VISTA PRINCIPAL HOME ('home') - APPLE MUSIC GLASSMORPHISM FUSION
   // -------------------------------------------------------------
   return (
-    <View style={[StyleSheet.absoluteFill, { backgroundColor: '#000000' }]} className="flex-1 bg-black">
+    <View style={[StyleSheet.absoluteFill, { backgroundColor: colors.background }]} className="flex-1">
       
       {/* CABECERA FLOTANTE ANIMADA (AnimatedHeader) */}
       <AnimatedHeader 
@@ -349,7 +354,8 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         scrollEventThrottle={16}
         showsVerticalScrollIndicator={false}
         contentContainerStyle={{ paddingBottom: 130, paddingTop: 130 }}
-        className="flex-1 bg-black"
+        className="flex-1"
+        style={{ backgroundColor: colors.background }}
       >
         {/* 1. GRID DE ACCESOS RÁPIDOS ESTILO CRISTAL (Glassmorphism 2x2 Grid) */}
         <View className="px-5 mb-8">
@@ -827,6 +833,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           tracksNeedingRepair={tracksNeedingRepair}
           onOptimize={onOptimize}
           isOptimizing={isOptimizing}
+          progressText={optimizationProgressText}
         />
 
         {/* Panel Inferior: Estado del Motor de Audio y Escaneo Rápido */}

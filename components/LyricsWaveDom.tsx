@@ -11,6 +11,7 @@ type AmLyricsElement = HTMLElement & {
   songAlbum?: string;
   songDuration?: number;
   query?: string;
+  ttml?: string;
   highlightColor?: string;
   autoscroll?: boolean;
   interpolate?: boolean;
@@ -25,6 +26,8 @@ export interface LyricsWaveDomProps {
   currentTimeMs: number;
   isPlaying: boolean;
   highlightColor?: string;
+  ttml?: string;
+  onUnavailable?: () => Promise<void>;
   onSeek: (seconds: number) => Promise<void>;
   dom?: unknown;
 }
@@ -37,6 +40,8 @@ export default function LyricsWaveDom({
   currentTimeMs,
   isPlaying,
   highlightColor = '#f6f4ef',
+  ttml,
+  onUnavailable,
   onSeek,
 }: LyricsWaveDomProps) {
   const lyricsRef = useRef<AmLyricsElement | null>(null);
@@ -49,11 +54,37 @@ export default function LyricsWaveDom({
     element.songAlbum = album;
     element.songDuration = durationMs;
     element.duration = durationMs;
-    element.query = `${title} ${artist}`.trim();
+    element.ttml = ttml || undefined;
+    element.query = ttml ? undefined : `${title} ${artist}`.trim();
     element.highlightColor = highlightColor;
     element.autoscroll = true;
     element.interpolate = true;
-  }, [album, artist, durationMs, highlightColor, title]);
+  }, [album, artist, durationMs, highlightColor, title, ttml]);
+
+  useEffect(() => {
+    if (ttml || !onUnavailable) return;
+    let cancelled = false;
+    let checks = 0;
+    const timer = window.setInterval(() => {
+      if (cancelled) return;
+      checks += 1;
+      const root = lyricsRef.current?.shadowRoot;
+      const renderedLyrics = root?.querySelector('.lyrics-line[id^="lyrics-line-"]');
+      if (renderedLyrics) {
+        window.clearInterval(timer);
+        return;
+      }
+      const empty = root?.querySelector('.no-lyrics, .lyrics-plus-empty, .empty-state, [data-empty="true"]');
+      if ((empty && checks >= 4) || checks >= 30) {
+        window.clearInterval(timer);
+        onUnavailable().catch(() => {});
+      }
+    }, 500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [onUnavailable, ttml]);
 
   useEffect(() => {
     const element = lyricsRef.current;

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   View,
   Text,
@@ -19,9 +19,11 @@ import {
   Info,
   Play,
   FileText,
+  FolderPlus,
 } from 'lucide-react-native';
 import { Track } from './PlayerBar';
-import { globalVertexQueueManager } from '../services/queue-service';
+import { PlaylistPickerModal } from './PlaylistPickerModal';
+import { enqueueTrack, removeTrackFromPlaybackQueue } from '../services/audio-service';
 
 export interface TrackOptionsModalProps {
   visible: boolean;
@@ -40,19 +42,20 @@ export const TrackOptionsModal: React.FC<TrackOptionsModalProps> = ({
   onRemoveFromQueue,
   onGoToLyrics,
 }) => {
+  const [playlistPickerOpen, setPlaylistPickerOpen] = useState(false);
   if (!track) return null;
 
   const imageUrl = track.artwork_thumb || track.artwork;
   const ICON_COLOR = '#ea580c'; // Naranja quemado / Rojo oscuro
 
   // Acciones conectadas
-  const handlePlayNext = () => {
+  const handlePlayNext = async () => {
     try {
       if (onPlayNext) {
         onPlayNext(track);
       } else {
         // Asumiendo que playNext inyecta la canción a continuación
-        globalVertexQueueManager.playNext(track as any);
+        await enqueueTrack(track, true);
       }
       onClose();
     } catch (error) {
@@ -60,21 +63,21 @@ export const TrackOptionsModal: React.FC<TrackOptionsModalProps> = ({
     }
   };
 
-  const handleAddToQueue = () => {
+  const handleAddToQueue = async () => {
     try {
-      globalVertexQueueManager.addToQueue(track as any);
+      await enqueueTrack(track, false);
       onClose();
     } catch (error) {
       console.error('Error al agregar a la cola:', error);
     }
   };
 
-  const handleRemoveFromQueue = () => {
+  const handleRemoveFromQueue = async () => {
     try {
       if (onRemoveFromQueue) {
         onRemoveFromQueue(track);
       } else {
-        globalVertexQueueManager.removeFromQueue(track.id);
+        await removeTrackFromPlaybackQueue(track.id);
       }
       onClose();
     } catch (error) {
@@ -92,11 +95,15 @@ export const TrackOptionsModal: React.FC<TrackOptionsModalProps> = ({
   };
 
   const handleShare = async () => {
-    await NativeShare.share({
-      title: track.title,
-      message: `${track.title} - ${track.artist}${track.url?.startsWith('http') ? `\n${track.url}` : ''}`,
-    });
-    onClose();
+    try {
+      await NativeShare.share({
+        title: track.title,
+        message: `${track.title} - ${track.artist}${track.url?.startsWith('http') ? `\n${track.url}` : ''}`,
+      });
+      onClose();
+    } catch {
+      Alert.alert('Compartir', 'No se pudo abrir el menu para compartir esta pista.');
+    }
   };
 
   const handleDetails = () => {
@@ -125,8 +132,9 @@ export const TrackOptionsModal: React.FC<TrackOptionsModalProps> = ({
   );
 
   return (
+    <>
     <Modal
-      visible={visible}
+      visible={visible && !playlistPickerOpen}
       transparent={true}
       animationType="slide"
       onRequestClose={onClose}
@@ -178,6 +186,7 @@ export const TrackOptionsModal: React.FC<TrackOptionsModalProps> = ({
 
               {/* Lista de Acciones (Botones) */}
               <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 20 }}>
+                {renderOption(<FolderPlus size={22} color={ICON_COLOR} />, 'Agregar a playlist', () => setPlaylistPickerOpen(true))}
                 {renderOption(<ListPlus size={22} color={ICON_COLOR} />, 'Reproducir siguiente', handlePlayNext)}
                 {renderOption(<ListMusic size={22} color={ICON_COLOR} />, 'Agregar a la cola de reproducción', handleAddToQueue)}
                 {renderOption(<ListMinus size={22} color={ICON_COLOR} />, 'Eliminar de la cola de reproducción', handleRemoveFromQueue)}
@@ -190,5 +199,16 @@ export const TrackOptionsModal: React.FC<TrackOptionsModalProps> = ({
         </View>
       </TouchableWithoutFeedback>
     </Modal>
+    <PlaylistPickerModal
+      visible={playlistPickerOpen}
+      track={track}
+      onClose={() => setPlaylistPickerOpen(false)}
+      onAdded={(playlist) => {
+        setPlaylistPickerOpen(false);
+        onClose();
+        Alert.alert('Playlist', `"${track.title}" se agrego a ${playlist.name}.`);
+      }}
+    />
+    </>
   );
 };

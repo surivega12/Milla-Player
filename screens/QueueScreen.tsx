@@ -1,26 +1,30 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  View,
+  Alert,
+  Image,
+  Modal,
+  StyleSheet,
   Text,
   TouchableOpacity,
-  Image,
-  StyleSheet,
-  FlatList,
-  Modal,
-  Alert,
+  View,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import {
   ArrowLeft,
-  Menu,
+  ChevronDown,
+  ChevronUp,
+  Disc,
   MoreVertical,
   Trash2,
-  Disc,
 } from 'lucide-react-native';
-import TrackPlayer from 'react-native-track-player';
+import TrackPlayer, { Event } from 'react-native-track-player';
+import { FlashList } from '@shopify/flash-list';
 import { Track } from '../components/PlayerBar';
-import { useVertexQueue } from '../services/queue-service';
-import { clearQueue } from '../services/audio-service';
 import { TrackOptionsModal } from '../components/TrackOptionsModal';
+import { clearQueue, persistPlaybackQueue } from '../services/audio-service';
+import { useTheme } from '../context/ThemeContext';
+
+type QueueTrack = Track & { isActive?: boolean; nativeIndex: number };
 
 export interface QueueScreenProps {
   isOpen: boolean;
@@ -32,243 +36,290 @@ export interface QueueScreenProps {
 export const QueueScreen: React.FC<QueueScreenProps> = ({
   isOpen,
   onClose,
-  onSelectTrack,
   onOpenLyrics,
 }) => {
-  const { priorityQueue, autoMixQueue, currentTrack, removeFromQueue, playNext } = useVertexQueue();
-  const [nativeQueue, setNativeQueue] = useState<Track[]>([]);
-  const [selectedTrackForOptions, setSelectedTrackForOptions] = useState<Track | null>(null);
-  const [isOptionsModalOpen, setIsOptionsModalOpen] = useState<boolean>(false);
+  const { colors } = useTheme();
+  const [nativeQueue, setNativeQueue] = useState<QueueTrack[]>([]);
+  const [selectedTrackForOptions, setSelectedTrackForOptions] = useState<QueueTrack | null>(null);
+  const [isOptionsModalOpen, setIsOptionsModalOpen] = useState(false);
 
-  // Sincronizar con TrackPlayer.getQueue()
+  const refreshQueue = useCallback(async () => {
+    try {
+      const [queue, activeIndex] = await Promise.all([
+        TrackPlayer.getQueue(),
+        TrackPlayer.getActiveTrackIndex(),
+      ]);
+      const firstVisibleIndex = Math.max(0, activeIndex ?? 0);
+      setNativeQueue(queue.map((track, index) => ({
+          ...(track as Track),
+          id: String(track.id || index),
+          url: String(track.url || ''),
+          title: String(track.title || 'Cancion sin titulo'),
+          artist: String(track.artist || 'Artista desconocido'),
+          album: String(track.album || 'Milla Library'),
+          artwork: track.artwork || undefined,
+          artwork_thumb: track.artwork || undefined,
+          duration: Number(track.duration || 0),
+          isActive: activeIndex === index,
+          nativeIndex: index,
+        }))
+        .filter((track) => track.nativeIndex >= firstVisibleIndex));
+    } catch (error) {
+      console.warn('[QueueScreen] No se pudo leer la cola nativa:', error);
+    }
+  }, []);
+
   useEffect(() => {
     if (!isOpen) return;
-    const fetchQueue = async () => {
-      try {
-        const q = await TrackPlayer.getQueue();
-        const activeIdx = await TrackPlayer.getActiveTrackIndex();
-        if (q && q.length > 0) {
-          const formatted = q.map((t, idx) => ({
-            id: String(t.id || idx),
-            url: String(t.url || ''),
-            title: String(t.title || 'Canción Sin Título'),
-            artist: String(t.artist || 'Artista Desconocido'),
-            album: String(t.album || 'Milla Hi-Res Library'),
-            artwork: t.artwork || undefined,
-            artwork_thumb: t.artwork || undefined,
-            duration: Number(t.duration || 0),
-            isActive: activeIdx === idx,
-          }));
-          setNativeQueue(formatted);
-        } else {
-          // Fallback al state de VertexQueue si el reproductor nativo aún no ha cargado una cola completa
-          const combined = [
-            ...(currentTrack ? [currentTrack] : []),
-            ...priorityQueue,
-            ...autoMixQueue,
-          ].map((t, idx) => ({
-            ...t,
-            isActive: idx === 0 && !!currentTrack && t.id === currentTrack.id,
-          }));
-          setNativeQueue(combined as Track[]);
-        }
-      } catch (e) {
-        console.warn('Error fetching native queue in QueueScreen:', e);
-      }
-    };
-    fetchQueue();
-    const interval = setInterval(fetchQueue, 2000);
-    return () => clearInterval(interval);
-  }, [isOpen, priorityQueue, autoMixQueue, currentTrack]);
+    void refreshQueue();
+    const subscription = TrackPlayer.addEventListener(Event.PlaybackActiveTrackChanged, refreshQueue);
+    return () => subscription.remove();
+  }, [isOpen, refreshQueue]);
 
-  if (!isOpen) return null;
+  const totalDuration = useMemo(
+    () => nativeQueue.reduce((total, track) => total + Number(track.duration || 0), 0),
+    [nativeQueue]
+  );
 
-  const handleClearQueue = async () => {
+  const formatDuration = (seconds: number) => {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const remaining = Math.floor(seconds % 60);
+    return hours > 0
+      ? `${hours}:${String(minutes).padStart(2, '0')}:${String(remaining).padStart(2, '0')}`
+      : `${minutes}:${String(remaining).padStart(2, '0')}`;
+  };
+
+  const handleRowPress = async (index: number) => {
+    try {
+      await TrackPlayer.skip(nativeQueue[index].nativeIndex);
+      await TrackPlayer.play();
+      await persistPlaybackQueue();
+      onClose();
+    } catch (error) {
+      Alert.alert('Cola', 'No se pudo abrir esa pista. Comprueba que el archivo siga disponible.');
+    }
+  };
+
+  const moveTrack = async (index: number, offset: number) => {
+    const destination = index + offset;
+    if (destination < 0 || destination >= nativeQueue.length) return;
+    if (nativeQueue[index].isActive || nativeQueue[destination].isActive) return;
+    try {
+      await TrackPlayer.move(nativeQueue[index].nativeIndex, nativeQueue[destination].nativeIndex);
+      await persistPlaybackQueue();
+      await refreshQueue();
+    } catch (error) {
+      console.warn('[QueueScreen] No se pudo reordenar la cola:', error);
+    }
+  };
+
+  const removeTrackAt = async (index: number) => {
+    if (nativeQueue[index]?.isActive) {
+      Alert.alert('Pista activa', 'Cambia de cancion antes de retirar la pista que esta sonando.');
+      return;
+    }
+    try {
+      await TrackPlayer.remove(nativeQueue[index].nativeIndex);
+      await persistPlaybackQueue();
+      await refreshQueue();
+    } catch (error) {
+      console.warn('[QueueScreen] No se pudo retirar la pista:', error);
+    }
+  };
+
+  const playNext = async (track: QueueTrack) => {
+    const currentIndex = await TrackPlayer.getActiveTrackIndex();
+    if (currentIndex === undefined || currentIndex === null || track.nativeIndex < 0) return;
+    const destination = currentIndex + 1;
+    if (track.nativeIndex !== destination) await TrackPlayer.move(track.nativeIndex, destination);
+    await persistPlaybackQueue();
+    await refreshQueue();
+  };
+
+  const handleClearQueue = () => {
     Alert.alert(
-      'Borrar cola de reproducción',
-      '¿Estás seguro de que deseas vaciar todas las pistas de la cola actual?',
+      'Limpiar proximas canciones',
+      'Se conservara la pista que esta sonando y se retirara el resto de la cola.',
       [
         { text: 'Cancelar', style: 'cancel' },
         {
-          text: 'Borrar',
+          text: 'Limpiar',
           style: 'destructive',
           onPress: async () => {
             await clearQueue();
-            setNativeQueue(currentTrack ? [{ ...currentTrack, isActive: true } as Track] : []);
+            await refreshQueue();
           },
         },
       ]
     );
   };
 
-  const handleRowPress = async (track: Track, index: number) => {
-    try {
-      if (onSelectTrack) {
-        onSelectTrack(track);
-      } else {
-        await TrackPlayer.skip(index);
-        await TrackPlayer.play();
-      }
-      onClose();
-    } catch (e) {
-      console.warn('Error saltando a pista en cola:', e);
-    }
-  };
-
-  const handleOpenOptions = (track: Track) => {
-    setSelectedTrackForOptions(track);
-    setIsOptionsModalOpen(true);
-  };
-
-  const totalDurationSeconds = nativeQueue.reduce((acc, t) => acc + (t.duration || 0), 0);
-  const formatTotalDuration = (secs: number) => {
-    const hrs = Math.floor(secs / 3600);
-    const mins = Math.floor((secs % 3600) / 60);
-    const s = Math.floor(secs % 60);
-    if (hrs > 0) {
-      return `${hrs}:${mins < 10 ? '0' : ''}${mins}:${s < 10 ? '0' : ''}${s}`;
-    }
-    return `${mins}:${s < 10 ? '0' : ''}${s}`;
-  };
+  if (!isOpen) return null;
 
   return (
-    <Modal
-      visible={isOpen}
-      animationType="slide"
-      transparent={false}
-      onRequestClose={onClose}
-    >
-      <View style={StyleSheet.absoluteFill} className="bg-black pt-12 pb-6 px-4">
-        {/* Cabecera Superior */}
-        <View className="flex-row items-center justify-between pb-4 border-b border-white/10 mb-2">
+    <Modal visible={isOpen} animationType="slide" onRequestClose={onClose}>
+      <SafeAreaView style={[styles.root, { backgroundColor: colors.background }]}>
+        <View style={[styles.header, { borderBottomColor: colors.border }]}>
           <TouchableOpacity
             onPress={onClose}
-            hitSlop={{ top: 15, bottom: 15, left: 15, right: 15 }}
-            className="w-10 h-10 rounded-full bg-neutral-900 items-center justify-center border border-white/10"
+            accessibilityRole="button"
+            accessibilityLabel="Cerrar cola"
+            style={[styles.iconButton, { backgroundColor: colors.card, borderColor: colors.border }]}
           >
-            <ArrowLeft size={22} color="#ffffff" />
+            <ArrowLeft size={21} color={colors.foreground} />
           </TouchableOpacity>
-
-          <View className="items-center flex-1 mx-4">
-            <Text className="text-xl font-bold text-white tracking-tight">
-              Cola de reproducción actual
-            </Text>
-            <Text className="text-xs font-semibold text-neutral-400 mt-0.5">
-              A continuación • {nativeQueue.length} {nativeQueue.length === 1 ? 'canción' : 'canciones'} ({formatTotalDuration(totalDurationSeconds)})
+          <View style={styles.headerText}>
+            <Text style={[styles.title, { color: colors.foreground }]}>Cola de reproduccion</Text>
+            <Text style={[styles.subtitle, { color: colors.mutedForeground }]}>
+              {nativeQueue.length} canciones, {formatDuration(totalDuration)}
             </Text>
           </View>
-
-          <View className="w-10" />
+          <View style={styles.headerSpacer} />
         </View>
 
-        {/* Lista de Canciones en la Cola */}
         {nativeQueue.length === 0 ? (
-          <View className="flex-1 items-center justify-center px-6">
-            <Disc size={48} color="rgba(255,255,255,0.2)" />
-            <Text className="text-base font-bold text-neutral-400 mt-4 text-center">
-              La cola de reproducción está vacía
-            </Text>
-            <Text className="text-xs text-neutral-600 mt-1 text-center">
-              Las próximas canciones y recomendaciones de MillaSmartDJ aparecerán aquí.
-            </Text>
+          <View style={styles.emptyState}>
+            <Disc size={46} color={colors.mutedForeground} />
+            <Text style={[styles.emptyTitle, { color: colors.foreground }]}>La cola esta vacia</Text>
+            <Text style={[styles.emptyCopy, { color: colors.mutedForeground }]}>Las proximas canciones apareceran aqui.</Text>
           </View>
         ) : (
-          <FlatList
+          <FlashList
             data={nativeQueue}
-            keyExtractor={(item, idx) => `${item.id}-${idx}`}
-            showsVerticalScrollIndicator={false}
-            contentContainerStyle={{ paddingBottom: 120 }}
-            renderItem={({ item, index }) => {
-              const isActive = (item as any).isActive || (currentTrack && currentTrack.id === item.id && index === 0);
-              const imageUrl = item.artwork_thumb || item.artwork;
-
-              return (
-                <TouchableOpacity
-                  activeOpacity={0.7}
-                  onPress={() => handleRowPress(item, index)}
-                  className={`flex-row items-center py-3 px-2 border-b border-white/5 rounded-xl ${
-                    isActive ? 'bg-white/10 border border-white/10' : ''
-                  }`}
-                >
-                  {/* Barras Horizontales de Arrastre (Drag Handle) */}
-                  <View className="pr-3 pl-1 justify-center items-center">
-                    <Menu size={20} color="#737373" />
-                  </View>
-
-                  {/* Carátula Pequeña */}
-                  <View className="w-12 h-12 rounded-lg bg-neutral-800 overflow-hidden border border-white/10 mr-3.5 items-center justify-center">
-                    {imageUrl ? (
-                      <Image source={{ uri: imageUrl }} className="w-full h-full" resizeMode="cover" />
-                    ) : (
-                      <Disc size={20} color="#737373" />
-                    )}
-                  </View>
-
-                  {/* Título en blanco y Artista en gris */}
-                  <View className="flex-1 justify-center mr-2">
-                    <Text
-                      numberOfLines={1}
-                      className={`text-base tracking-tight ${
-                        isActive ? 'font-black text-[#ea580c]' : 'font-semibold text-white'
-                      }`}
-                    >
-                      {item.title || 'Canción Sin Título'}
-                    </Text>
-                    <Text numberOfLines={1} className="text-sm font-medium text-neutral-400 mt-0.5">
-                      {item.artist || 'Artista Desconocido'}
-                    </Text>
-                  </View>
-
-                  {/* Botón de tres puntos a la derecha */}
+            keyExtractor={(item, index) => `${item.id}-${index}`}
+            contentContainerStyle={styles.listContent}
+            renderItem={({ item, index }) => (
+              <TouchableOpacity
+                activeOpacity={0.72}
+                onPress={() => void handleRowPress(index)}
+                style={[
+                  styles.row,
+                  { borderBottomColor: colors.border },
+                  item.isActive && { backgroundColor: colors.secondary },
+                ]}
+              >
+                <View style={styles.orderControls}>
                   <TouchableOpacity
-                    onPress={() => handleOpenOptions(item)}
-                    hitSlop={{ top: 15, bottom: 15, left: 15, right: 15 }}
-                    className="p-2 justify-center items-center"
+                    disabled={index === 0}
+                    onPress={(event) => {
+                      event.stopPropagation();
+                      void moveTrack(index, -1);
+                    }}
+                    accessibilityLabel="Mover hacia arriba"
+                    style={styles.orderButton}
                   >
-                    <MoreVertical size={20} color="#a3a3a3" />
+                    <ChevronUp size={16} color={index === 0 ? colors.border : colors.mutedForeground} />
                   </TouchableOpacity>
+                  <TouchableOpacity
+                    disabled={index === nativeQueue.length - 1}
+                    onPress={(event) => {
+                      event.stopPropagation();
+                      void moveTrack(index, 1);
+                    }}
+                    accessibilityLabel="Mover hacia abajo"
+                    style={styles.orderButton}
+                  >
+                    <ChevronDown size={16} color={index === nativeQueue.length - 1 ? colors.border : colors.mutedForeground} />
+                  </TouchableOpacity>
+                </View>
+
+                <View style={[styles.artwork, { backgroundColor: colors.muted, borderColor: colors.border }]}>
+                  {item.artwork_thumb || item.artwork ? (
+                    <Image source={{ uri: item.artwork_thumb || item.artwork }} style={StyleSheet.absoluteFill} />
+                  ) : (
+                    <Disc size={19} color={colors.mutedForeground} />
+                  )}
+                </View>
+
+                <View style={styles.trackText}>
+                  <Text
+                    numberOfLines={1}
+                    style={[styles.trackTitle, { color: item.isActive ? colors.primary : colors.foreground }]}
+                  >
+                    {item.title}
+                  </Text>
+                  <Text numberOfLines={1} style={[styles.artist, { color: colors.mutedForeground }]}>
+                    {item.artist}
+                  </Text>
+                </View>
+
+                <TouchableOpacity
+                  onPress={(event) => {
+                    event.stopPropagation();
+                    void removeTrackAt(index);
+                  }}
+                  accessibilityLabel="Retirar de la cola"
+                  style={[styles.rowAction, item.isActive && styles.disabledAction]}
+                >
+                  <Trash2 size={17} color={item.isActive ? colors.border : colors.mutedForeground} />
                 </TouchableOpacity>
-              );
-            }}
+                <TouchableOpacity
+                  onPress={(event) => {
+                    event.stopPropagation();
+                    setSelectedTrackForOptions(item);
+                    setIsOptionsModalOpen(true);
+                  }}
+                  accessibilityLabel="Mas opciones"
+                  style={styles.rowAction}
+                >
+                  <MoreVertical size={19} color={colors.mutedForeground} />
+                </TouchableOpacity>
+              </TouchableOpacity>
+            )}
           />
         )}
 
-        {/* Botón Flotante Ovalado "Borrar cola" ('bg-sky-200' con texto negro) */}
-        {nativeQueue.length > 0 && (
+        {nativeQueue.length > 1 ? (
           <TouchableOpacity
-            activeOpacity={0.85}
             onPress={handleClearQueue}
-            style={styles.floatingButton}
-            className="flex-row items-center gap-2.5 px-6 py-3.5 rounded-full bg-sky-200 border border-sky-300 shadow-2xl absolute bottom-8 right-6"
+            style={[styles.clearButton, { backgroundColor: colors.primary }]}
           >
-            <Trash2 size={18} color="#000000" />
-            <Text className="text-sm font-black text-black tracking-wide uppercase">
-              Borrar cola
-            </Text>
+            <Trash2 size={17} color={colors.primaryForeground} />
+            <Text style={[styles.clearText, { color: colors.primaryForeground }]}>Limpiar proximas</Text>
           </TouchableOpacity>
-        )}
+        ) : null}
 
-        {/* Modal de Opciones Integrado */}
         <TrackOptionsModal
           visible={isOptionsModalOpen}
           track={selectedTrackForOptions}
           onClose={() => setIsOptionsModalOpen(false)}
           onPlayNext={(track) => {
-            playNext(track as any);
-            setIsOptionsModalOpen(false);
+            const queuedTrack = nativeQueue.find((item) => item.id === track.id);
+            if (queuedTrack) void playNext(queuedTrack);
           }}
+          onRemoveFromQueue={(track) => {
+            const index = nativeQueue.findIndex((item) => item.id === track.id);
+            if (index >= 0) void removeTrackAt(index);
+          }}
+          onGoToLyrics={(track) => onOpenLyrics?.(track)}
         />
-      </View>
+      </SafeAreaView>
     </Modal>
   );
 };
 
 const styles = StyleSheet.create({
-  floatingButton: {
-    shadowColor: '#38bdf8',
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.4,
-    shadowRadius: 10,
-    elevation: 12,
-  },
+  root: { flex: 1, paddingHorizontal: 16 },
+  header: { height: 68, flexDirection: 'row', alignItems: 'center', borderBottomWidth: StyleSheet.hairlineWidth },
+  iconButton: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center', borderRadius: 8, borderWidth: 1 },
+  headerText: { flex: 1, alignItems: 'center', paddingHorizontal: 10 },
+  title: { fontSize: 18, fontWeight: '800' },
+  subtitle: { fontSize: 12, marginTop: 2 },
+  headerSpacer: { width: 40 },
+  listContent: { paddingBottom: 104 },
+  row: { minHeight: 68, flexDirection: 'row', alignItems: 'center', borderBottomWidth: StyleSheet.hairlineWidth, paddingVertical: 8 },
+  orderControls: { width: 30, height: 48, justifyContent: 'space-between', alignItems: 'center', marginRight: 5 },
+  orderButton: { width: 28, height: 22, alignItems: 'center', justifyContent: 'center' },
+  artwork: { width: 48, height: 48, borderRadius: 6, borderWidth: 1, overflow: 'hidden', alignItems: 'center', justifyContent: 'center' },
+  trackText: { flex: 1, minWidth: 0, paddingHorizontal: 12 },
+  trackTitle: { fontSize: 15, fontWeight: '700' },
+  artist: { fontSize: 12, marginTop: 3 },
+  rowAction: { width: 35, height: 40, alignItems: 'center', justifyContent: 'center' },
+  disabledAction: { opacity: 0.45 },
+  emptyState: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 30 },
+  emptyTitle: { marginTop: 16, fontSize: 17, fontWeight: '800' },
+  emptyCopy: { marginTop: 5, fontSize: 13, textAlign: 'center' },
+  clearButton: { position: 'absolute', right: 20, bottom: 24, minHeight: 46, flexDirection: 'row', alignItems: 'center', gap: 8, paddingHorizontal: 18, borderRadius: 8, elevation: 7 },
+  clearText: { fontSize: 12, fontWeight: '900', textTransform: 'uppercase' },
 });

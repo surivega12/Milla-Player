@@ -1,193 +1,304 @@
-"""
-Punto 2.3: Motor DSP para AutoMix (Librosa BPM, Clave Camelot y Spleeter/Vocal Detection).
+"""Audio analysis used by Milla AutoMix.
 
-Recibe fragmentos de audio o archivos locales, ejecuta análisis armónico mediante transformadas
-de Fourier (Chroma CQT) y detección de transitorios de percusión, y guarda los datos en caché.
+The engine deliberately analyzes both ends of the file. AutoMix needs the real
+outro, so analyzing only the first minute produces unusable transition points.
 """
-import os
+
 import hashlib
+import os
+from typing import Any, Dict, Iterable, Tuple
+
 import numpy as np
-from typing import Dict, Any, Tuple
+
 from ..models import AudioAnalysisCache
 
 try:
     import librosa
+
     LIBROSA_AVAILABLE = True
 except ImportError:
+    librosa = None
     LIBROSA_AVAILABLE = False
 
 
-# Mapeo de Tonos Krumhansl-Schmuckler a Rueda de Camelot (DJ Harmonic Mixing)
+ANALYSIS_VERSION = "milla-dsp-2"
+TARGET_SAMPLE_RATE = 22050
+SEGMENT_SECONDS = 45.0
+
 CAMELOT_KEY_MAP = {
-    # Mayores (B)
     ('C', 'major'): '8B', ('G', 'major'): '9B', ('D', 'major'): '10B', ('A', 'major'): '11B',
     ('E', 'major'): '12B', ('B', 'major'): '1B', ('F#', 'major'): '2B', ('C#', 'major'): '3B',
     ('G#', 'major'): '4B', ('D#', 'major'): '5B', ('A#', 'major'): '6B', ('F', 'major'): '7B',
-    # Menores (A)
     ('A', 'minor'): '8A', ('E', 'minor'): '9A', ('B', 'minor'): '10A', ('F#', 'minor'): '11A',
     ('C#', 'minor'): '12A', ('G#', 'minor'): '1A', ('D#', 'minor'): '2A', ('A#', 'minor'): '3A',
     ('F', 'minor'): '4A', ('C', 'minor'): '5A', ('G', 'minor'): '6A', ('D', 'minor'): '7A',
 }
 
 PITCH_CLASSES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-
-# Perfiles de Krumhansl-Schmuckler
-KS_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
-KS_MINOR = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17]
+KS_MAJOR = np.asarray([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+KS_MINOR = np.asarray([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
 
 
 class DSPEngine:
     @classmethod
     def analyze_fragment(cls, file_path: str, track_id: str) -> Dict[str, Any]:
-        """
-        Analiza un archivo de audio o fragmento (30 seg intro/outro) y calcula BPM, Camelot Key y Silencio Vocal.
-        """
-        # 1. Calcular hash de archivo
+        track_id = str(track_id or '')[:255]
+        if not LIBROSA_AVAILABLE:
+            return cls._failure(track_id, 'LIBROSA_UNAVAILABLE')
+        if not os.path.isfile(file_path):
+            return cls._failure(track_id, 'AUDIO_NOT_FOUND')
+
         file_hash = cls._compute_file_hash(file_path)
-        
-        # 2. Consultar caché local de Django
         cached = AudioAnalysisCache.objects.filter(file_hash=file_hash).first()
         if cached:
-            return {
-                "track_id": track_id or cached.track_id,
-                "bpm": round(cached.bpm, 2),
-                "camelot_key": cached.camelot_key,
-                "vocal_silence_start_ms": cached.vocal_silence_start_ms,
-                "vocal_silence_end_ms": cached.vocal_silence_end_ms,
-                "intro_duration_ms": cached.intro_duration_ms,
-                "outro_duration_ms": cached.outro_duration_ms,
-                "cached": True
-            }
-
-        if not LIBROSA_AVAILABLE or not os.path.exists(file_path):
-            # Si no está librosa disponible o no existe el archivo temporal, valores seguros
-            return cls._save_and_return(file_hash, track_id, 120.0, '8A', 0.0, 0.0, 0.0, 0.0)
+            return cls._cached_payload(cached, track_id)
 
         try:
-            # Cargar audio a 22050Hz mono para velocidad óptima DSP
-            y, sr = librosa.load(file_path, sr=22050, mono=True, duration=60.0)
-            
-            # A. Cálculo preciso de BPM (Tempo)
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-            if isinstance(tempo, np.ndarray):
-                bpm_val = float(tempo[0]) if len(tempo) > 0 else 120.0
+            duration_seconds = float(librosa.get_duration(path=file_path))
+            if not np.isfinite(duration_seconds) or duration_seconds <= 0:
+                return cls._failure(track_id, 'INVALID_DURATION')
+
+            segment_length = min(SEGMENT_SECONDS, duration_seconds)
+            outro_offset = max(0.0, duration_seconds - segment_length)
+            intro, sample_rate = librosa.load(
+                file_path,
+                sr=TARGET_SAMPLE_RATE,
+                mono=True,
+                offset=0.0,
+                duration=segment_length,
+            )
+            if outro_offset > 0.5:
+                outro, _ = librosa.load(
+                    file_path,
+                    sr=TARGET_SAMPLE_RATE,
+                    mono=True,
+                    offset=outro_offset,
+                    duration=segment_length,
+                )
             else:
-                bpm_val = float(tempo)
-            if bpm_val <= 40 or bpm_val >= 240:
-                bpm_val = 120.0
+                outro = intro
 
-            # B. Cálculo de Clave Musical y Rueda de Camelot
-            camelot_key = cls._estimate_camelot_key(y, sr)
+            if intro.size == 0 or outro.size == 0:
+                return cls._failure(track_id, 'EMPTY_AUDIO')
 
-            # C. Detección de silencio vocal / intro / outro
-            v_start, v_end, intro_ms, outro_ms = cls._estimate_vocal_silence_and_transitions(y, sr)
+            bpm = cls._estimate_tempo((intro, outro), sample_rate)
+            key_audio = np.concatenate((intro, outro)) if outro_offset > 0.5 else intro
+            camelot_key = cls._estimate_camelot_key(key_audio, sample_rate)
+            transitions = cls._estimate_transitions(
+                intro,
+                outro,
+                sample_rate,
+                duration_seconds,
+                outro_offset,
+                bpm,
+            )
 
-            return cls._save_and_return(file_hash, track_id, bpm_val, camelot_key, v_start, v_end, intro_ms, outro_ms)
-            
-        except Exception as e:
-            print(f"[DSPEngine] Error analizando '{file_path}': {e}")
-            return cls._save_and_return(file_hash, track_id, 120.0, '8A', 0.0, 0.0, 0.0, 0.0)
+            if bpm <= 0 and not camelot_key:
+                return cls._failure(track_id, 'ANALYSIS_INCONCLUSIVE')
+
+            metadata = {
+                'engine': 'librosa/chroma-cqt/hpss',
+                'analysis_version': ANALYSIS_VERSION,
+                'duration_ms': round(duration_seconds * 1000.0, 1),
+                'sample_rate': sample_rate,
+                'segments_seconds': segment_length,
+                **transitions,
+            }
+            return cls._save_and_return(
+                file_hash,
+                track_id,
+                bpm,
+                camelot_key,
+                transitions['vocal_silence_start_ms'],
+                transitions['vocal_silence_end_ms'],
+                transitions['intro_duration_ms'],
+                transitions['outro_duration_ms'],
+                metadata,
+            )
+        except Exception as error:
+            print(f"[DSPEngine] Error analyzing '{file_path}': {error}")
+            return cls._failure(track_id, 'ANALYSIS_ERROR', str(error))
+
+    @staticmethod
+    def _normalize_tempo(value: float) -> float:
+        if not np.isfinite(value) or value <= 0:
+            return 0.0
+        while value < 70.0:
+            value *= 2.0
+        while value > 190.0:
+            value /= 2.0
+        return value if 45.0 <= value <= 220.0 else 0.0
 
     @classmethod
-    def _estimate_camelot_key(cls, y: np.ndarray, sr: int) -> str:
-        """Estimación de tonalidad mediante Chromagram CQT y correlación KS."""
+    def _estimate_tempo(cls, segments: Iterable[np.ndarray], sample_rate: int) -> float:
+        candidates = []
+        for audio in segments:
+            try:
+                onset_envelope = librosa.onset.onset_strength(y=audio, sr=sample_rate)
+                tempo = librosa.feature.tempo(
+                    onset_envelope=onset_envelope,
+                    sr=sample_rate,
+                    aggregate=np.median,
+                )
+                value = float(np.ravel(tempo)[0]) if np.size(tempo) else 0.0
+                value = cls._normalize_tempo(value)
+                if value:
+                    candidates.append(value)
+            except Exception:
+                continue
+        return round(float(np.median(candidates)), 2) if candidates else 0.0
+
+    @classmethod
+    def _estimate_camelot_key(cls, audio: np.ndarray, sample_rate: int) -> str:
         try:
-            chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+            harmonic, _ = librosa.effects.hpss(audio)
+            chroma = librosa.feature.chroma_cqt(y=harmonic, sr=sample_rate)
             chroma_mean = np.mean(chroma, axis=1)
-            
-            best_corr = -1.0
-            best_key = ('C', 'major')
+            if not np.all(np.isfinite(chroma_mean)) or float(np.sum(chroma_mean)) <= 0:
+                return ''
 
-            for i in range(12):
-                # Rotar perfiles para cada nota raíz
-                maj_profile = np.roll(KS_MAJOR, i)
-                min_profile = np.roll(KS_MINOR, i)
-
-                corr_maj = np.corrcoef(chroma_mean, maj_profile)[0, 1]
-                corr_min = np.corrcoef(chroma_mean, min_profile)[0, 1]
-
-                if corr_maj > best_corr:
-                    best_corr = corr_maj
-                    best_key = (PITCH_CLASSES[i], 'major')
-                if corr_min > best_corr:
-                    best_corr = corr_min
-                    best_key = (PITCH_CLASSES[i], 'minor')
-
-            return CAMELOT_KEY_MAP.get(best_key, '8A')
+            best_correlation = -1.0
+            best_key = None
+            for pitch_index in range(12):
+                for mode, profile in (('major', KS_MAJOR), ('minor', KS_MINOR)):
+                    correlation = float(np.corrcoef(chroma_mean, np.roll(profile, pitch_index))[0, 1])
+                    if np.isfinite(correlation) and correlation > best_correlation:
+                        best_correlation = correlation
+                        best_key = (PITCH_CLASSES[pitch_index], mode)
+            return CAMELOT_KEY_MAP.get(best_key, '') if best_key else ''
         except Exception:
-            return '8A'
+            return ''
 
     @classmethod
-    def _estimate_vocal_silence_and_transitions(cls, y: np.ndarray, sr: int) -> Tuple[float, float, float, float]:
-        """
-        Estima el inicio y fin de la voz (o silencio vocal) para AutoMix, midiendo la energía en la banda
-        frecuencial vocal (300Hz - 3400Hz) o usando Spleeter en modo 2stems si está configurado.
-        """
+    def _estimate_transitions(
+        cls,
+        intro: np.ndarray,
+        outro: np.ndarray,
+        sample_rate: int,
+        duration_seconds: float,
+        outro_offset: float,
+        bpm: float,
+    ) -> Dict[str, float]:
+        intro_intervals = librosa.effects.split(intro, top_db=36)
+        outro_intervals = librosa.effects.split(outro, top_db=36)
+
+        audible_start = float(intro_intervals[0][0] / sample_rate) if len(intro_intervals) else 0.0
+        audible_end_local = (
+            float(outro_intervals[-1][1] / sample_rate)
+            if len(outro_intervals)
+            else float(len(outro) / sample_rate)
+        )
+        audible_end = min(duration_seconds, outro_offset + audible_end_local)
+
+        intro_rms = librosa.feature.rms(y=intro)[0]
+        outro_rms = librosa.feature.rms(y=outro)[0]
+        energy_reference = max(float(np.percentile(np.concatenate((intro_rms, outro_rms)), 90)), 1e-9)
+        intro_energy = min(1.0, float(np.mean(intro_rms)) / energy_reference)
+        outro_energy = min(1.0, float(np.mean(outro_rms)) / energy_reference)
+
+        beat_interval_ms = 60000.0 / bpm if bpm > 0 else 0.0
+        transition_seconds = min(12.0, max(3.0, (beat_interval_ms * 8.0 / 1000.0) if beat_interval_ms else 6.0))
+        target_outro_local = max(0.0, audible_end_local - transition_seconds)
+
         try:
-            # Separación armónico-percusiva como aproximación vocal limpia
-            y_harm, _ = librosa.effects.hpss(y)
-            rms = librosa.feature.rms(y=y_harm)[0]
-            frames = len(rms)
-            threshold = np.max(rms) * 0.15
-
-            start_frame = 0
-            for i in range(frames):
-                if rms[i] > threshold:
-                    start_frame = i
-                    break
-
-            end_frame = frames - 1
-            for i in range(frames - 1, -1, -1):
-                if rms[i] > threshold:
-                    end_frame = i
-                    break
-
-            start_ms = float(librosa.frames_to_time(start_frame, sr=sr) * 1000.0)
-            end_ms = float(librosa.frames_to_time(end_frame, sr=sr) * 1000.0)
-            total_duration_ms = float(len(y) / sr * 1000.0)
-
-            intro_ms = start_ms
-            outro_ms = max(0.0, total_duration_ms - end_ms)
-
-            return round(start_ms, 1), round(end_ms, 1), round(intro_ms, 1), round(outro_ms, 1)
+            _, beat_frames = librosa.beat.beat_track(y=outro, sr=sample_rate)
+            beat_times = librosa.frames_to_time(beat_frames, sr=sample_rate)
+            eligible = beat_times[beat_times <= target_outro_local + 1.0]
+            if eligible.size:
+                target_outro_local = float(eligible[-1])
         except Exception:
-            return 0.0, 0.0, 0.0, 0.0
+            pass
+
+        outro_start = min(audible_end, max(outro_offset, outro_offset + target_outro_local))
+        outro_duration = max(1000.0, (duration_seconds - outro_start) * 1000.0)
+        intro_duration = max(1000.0, (audible_start + transition_seconds) * 1000.0)
+
+        return {
+            'vocal_silence_start_ms': round(audible_start * 1000.0, 1),
+            'vocal_silence_end_ms': round(audible_end * 1000.0, 1),
+            'intro_duration_ms': round(intro_duration, 1),
+            'outro_duration_ms': round(outro_duration, 1),
+            'outro_start_ms': round(outro_start * 1000.0, 1),
+            'intro_energy': round(intro_energy, 4),
+            'outro_energy': round(outro_energy, 4),
+            'beat_interval_ms': round(beat_interval_ms, 2),
+        }
 
     @classmethod
-    def _save_and_return(cls, file_hash: str, track_id: str, bpm: float, camelot: str, v_start: float, v_end: float, intro: float, outro: float) -> Dict[str, Any]:
-        AudioAnalysisCache.objects.update_or_create(
+    def _cached_payload(cls, cached: AudioAnalysisCache, requested_track_id: str) -> Dict[str, Any]:
+        metadata = cached.analysis_metadata or {}
+        return {
+            'track_id': requested_track_id or cached.track_id,
+            'bpm': round(cached.bpm, 2),
+            'camelot_key': cached.camelot_key,
+            'vocal_silence_start_ms': cached.vocal_silence_start_ms,
+            'vocal_silence_end_ms': cached.vocal_silence_end_ms,
+            'intro_duration_ms': cached.intro_duration_ms,
+            'outro_duration_ms': cached.outro_duration_ms,
+            'outro_start_ms': metadata.get('outro_start_ms'),
+            'intro_energy': metadata.get('intro_energy'),
+            'outro_energy': metadata.get('outro_energy'),
+            'beat_interval_ms': metadata.get('beat_interval_ms'),
+            'duration_ms': metadata.get('duration_ms'),
+            'analysis_version': metadata.get('analysis_version', ANALYSIS_VERSION),
+            'analysis_status': 'ready',
+            'cached': True,
+            'success': True,
+        }
+
+    @classmethod
+    def _save_and_return(
+        cls,
+        file_hash: str,
+        track_id: str,
+        bpm: float,
+        camelot_key: str,
+        vocal_start: float,
+        vocal_end: float,
+        intro_duration: float,
+        outro_duration: float,
+        metadata: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        cached, _ = AudioAnalysisCache.objects.update_or_create(
             file_hash=file_hash,
             defaults={
-                "track_id": track_id or file_hash[:16],
-                "bpm": bpm,
-                "camelot_key": camelot,
-                "vocal_silence_start_ms": v_start,
-                "vocal_silence_end_ms": v_end,
-                "intro_duration_ms": intro,
-                "outro_duration_ms": outro,
-                "analysis_metadata": {"engine": "Librosa/ChromaCQT+HPSS"}
-            }
+                'track_id': track_id or file_hash[:16],
+                'bpm': bpm,
+                'camelot_key': camelot_key,
+                'vocal_silence_start_ms': vocal_start,
+                'vocal_silence_end_ms': vocal_end,
+                'intro_duration_ms': intro_duration,
+                'outro_duration_ms': outro_duration,
+                'analysis_metadata': metadata,
+            },
         )
-        return {
-            "track_id": track_id,
-            "bpm": round(bpm, 2),
-            "camelot_key": camelot,
-            "vocal_silence_start_ms": v_start,
-            "vocal_silence_end_ms": v_end,
-            "intro_duration_ms": intro,
-            "outro_duration_ms": outro,
-            "cached": False
+        payload = cls._cached_payload(cached, track_id)
+        payload['cached'] = False
+        return payload
+
+    @staticmethod
+    def _failure(track_id: str, reason: str, detail: str = '') -> Dict[str, Any]:
+        payload = {
+            'track_id': track_id,
+            'success': False,
+            'cached': False,
+            'analysis_status': 'failed',
+            'reason': reason,
         }
+        if detail:
+            payload['detail'] = detail[:300]
+        return payload
 
     @staticmethod
     def _compute_file_hash(file_path: str) -> str:
-        if not os.path.exists(file_path):
-            return hashlib.sha256(file_path.encode('utf-8')).hexdigest()
+        """Create a stable fingerprint without reading a multi-gigabyte file twice."""
         hasher = hashlib.sha256()
-        try:
-            with open(file_path, 'rb') as f:
-                while chunk := f.read(65536):
-                    hasher.update(chunk)
-            return hasher.hexdigest()
-        except Exception:
-            return hashlib.sha256(file_path.encode('utf-8')).hexdigest()
+        file_size = os.path.getsize(file_path)
+        hasher.update(str(file_size).encode('ascii'))
+        chunk_size = 256 * 1024
+        offsets = {0, max(0, file_size // 2 - chunk_size // 2), max(0, file_size - chunk_size)}
+        with open(file_path, 'rb') as audio_file:
+            for offset in sorted(offsets):
+                audio_file.seek(offset)
+                hasher.update(audio_file.read(chunk_size))
+        return hasher.hexdigest()

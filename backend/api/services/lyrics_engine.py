@@ -6,6 +6,8 @@ a estructuras JSON optimizadas para el lector de React Native Reanimated, y lo c
 """
 import re
 import requests
+import unicodedata
+from difflib import SequenceMatcher
 from typing import Dict, Any, List, Optional
 from ..models import LyricsCache
 
@@ -14,6 +16,50 @@ class LyricsEngine:
     LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
     LRCLIB_GET_URL = "https://lrclib.net/api/get"
     USER_AGENT = "VertexMusicEngine/2.0.0 ( contact@milla.app )"
+
+    @staticmethod
+    def _normalize_match_value(value: Any) -> str:
+        normalized = unicodedata.normalize('NFKD', str(value or '')).encode('ascii', 'ignore').decode('ascii')
+        return re.sub(r'[^a-z0-9]+', ' ', normalized.lower()).strip()
+
+    @classmethod
+    def _score_search_result(
+        cls,
+        result: Dict[str, Any],
+        title: str,
+        artist: str,
+        album: str,
+        duration: float,
+    ) -> float:
+        requested_title = cls._normalize_match_value(title)
+        requested_artist = cls._normalize_match_value(artist)
+        candidate_title = cls._normalize_match_value(result.get('trackName'))
+        candidate_artist = cls._normalize_match_value(result.get('artistName'))
+        if not requested_title or not requested_artist or not candidate_title or not candidate_artist:
+            return -1.0
+
+        title_ratio = SequenceMatcher(None, requested_title, candidate_title).ratio()
+        artist_ratio = SequenceMatcher(None, requested_artist, candidate_artist).ratio()
+        if title_ratio < 0.52 or artist_ratio < 0.45:
+            return -1.0
+
+        score = title_ratio * 55.0 + artist_ratio * 30.0
+        if album and result.get('albumName'):
+            score += SequenceMatcher(
+                None,
+                cls._normalize_match_value(album),
+                cls._normalize_match_value(result.get('albumName')),
+            ).ratio() * 7.0
+        try:
+            candidate_duration = float(result.get('duration') or 0.0)
+            if duration > 0 and candidate_duration > 0:
+                difference = abs(duration - candidate_duration)
+                score += 12.0 if difference <= 2.0 else 7.0 if difference <= 5.0 else -12.0 if difference > 15.0 else 0.0
+        except (TypeError, ValueError):
+            pass
+        if result.get('syncedLyrics'):
+            score += 6.0
+        return score
 
     @classmethod
     def get_or_fetch_lyrics(cls, track_id: str, title: str, artist: str, album: str = "", duration: float = 0.0) -> Dict[str, Any]:
@@ -62,9 +108,17 @@ class LyricsEngine:
                 if resp.status_code == 200:
                     results = resp.json()
                     if isinstance(results, list) and len(results) > 0:
-                        # Priorizar resultado con syncedLyrics
-                        best_match = next((r for r in results if r.get("syncedLyrics")), results[0])
-                        lrc_content = best_match.get("syncedLyrics") or best_match.get("plainLyrics") or ""
+                        ranked_results = sorted(
+                            (
+                                (cls._score_search_result(result, title, artist, album, duration), result)
+                                for result in results
+                            ),
+                            key=lambda item: item[0],
+                            reverse=True,
+                        )
+                        if ranked_results and ranked_results[0][0] >= 48.0:
+                            best_match = ranked_results[0][1]
+                            lrc_content = best_match.get("syncedLyrics") or best_match.get("plainLyrics") or ""
         except Exception as e:
             # Fallback tolerante a fallos de red
             print(f"[LyricsEngine] Error consultando servicio externo para '{title} - {artist}': {e}")

@@ -24,7 +24,8 @@ export class VertexQueueManager {
   private bpmTolerance: number = 3;
   private isSessionAutoMixForced: boolean = false;
   private harmonicMode: 'strict' | 'energy' | 'free' = 'strict';
-  private transitionSeconds: number = 1.2;
+  private transitionSeconds: number = 6;
+  private crossOutEnabled: boolean = true;
 
   constructor(catalog: VertexTrack[] = []) {
     this.fullCatalog = catalog;
@@ -52,8 +53,9 @@ export class VertexQueueManager {
       this.bpmTolerance = settings.bpm_tolerance;
       this.harmonicMode = settings.harmonic_mode;
       this.transitionSeconds = settings.crossfade_seconds > 0
-        ? Math.min(Math.max(settings.crossfade_seconds, 0.8), 3)
-        : 1.2;
+        ? Math.min(Math.max(settings.crossfade_seconds, 1), 12)
+        : 6;
+      this.crossOutEnabled = settings.cross_out_enabled;
       if (!this.isAutoMixEnabled && !this.isSessionAutoMixForced) {
         this.autoMixQueue = [];
       } else {
@@ -81,6 +83,26 @@ export class VertexQueueManager {
 
   public getTransitionSeconds(): number {
     return this.transitionSeconds;
+  }
+
+  public isCrossOutEnabled(): boolean {
+    return this.crossOutEnabled;
+  }
+
+  public getCatalogTrack(trackId: string): VertexTrack | null {
+    return this.fullCatalog.find((track) => track.id === trackId) ?? null;
+  }
+
+  public getSequentialTracksAfter(trackId: string, count = 24, excludedIds: Set<string> = new Set()): VertexTrack[] {
+    if (this.fullCatalog.length === 0) return [];
+    const startIndex = this.fullCatalog.findIndex((track) => track.id === trackId);
+    if (startIndex < 0) return [];
+    const result: VertexTrack[] = [];
+    for (let step = 1; step < this.fullCatalog.length && result.length < count; step++) {
+      const candidate = this.fullCatalog[(startIndex + step) % this.fullCatalog.length];
+      if (candidate.id !== trackId && !excludedIds.has(candidate.id)) result.push(candidate);
+    }
+    return result;
   }
 
   public setCatalog(catalog: VertexTrack[]): void {
@@ -198,7 +220,10 @@ export class VertexQueueManager {
       this.currentTrack ||
       this.history[this.history.length - 1];
 
-    if (!referenceTrack || this.fullCatalog.length === 0) return;
+    if (!referenceTrack || this.fullCatalog.length === 0) {
+      this.autoMixQueue = [];
+      return;
+    }
 
     const excludedIds = new Set([
       ...this.history.slice(-15).map(t => t.id),
@@ -223,11 +248,17 @@ export class VertexQueueManager {
     const currentBpm = current.bpm;
     const nextBpm = next.bpm;
     if (currentBpm && nextBpm) {
-      const bpmDiff = Math.abs(currentBpm - nextBpm);
+      const tempoCandidates = [nextBpm, nextBpm * 2, nextBpm / 2];
+      const normalizedNextBpm = tempoCandidates.reduce((best, candidate) =>
+        Math.abs(candidate - currentBpm) < Math.abs(best - currentBpm) ? candidate : best
+      );
+      const bpmDiff = Math.abs(currentBpm - normalizedNextBpm);
       const bpmDiffPercent = bpmDiff / currentBpm;
       if (bpmDiff > this.bpmTolerance) score -= 60;
       else if (bpmDiffPercent > 0.05) score -= 30;
       else score += (this.bpmTolerance - bpmDiff) * 10;
+    } else {
+      score -= 20;
     }
 
     const currentKey = current.camelotKey || current.camelot_key || current.key || '';
@@ -240,11 +271,18 @@ export class VertexQueueManager {
       else score -= this.harmonicMode === 'strict' ? 40 : 15;
     }
 
-    if (current.hasVocalOutro && next.hasVocalIntro) {
+    if (current.hasVocalOutro === true && next.hasVocalIntro === true) {
       score -= 60;
-    } else if (!current.hasVocalOutro && !next.hasVocalIntro) {
+    } else if (current.hasVocalOutro === false && next.hasVocalIntro === false) {
       score += 20;
     }
+
+    if (current.outro_energy != null && next.intro_energy != null) {
+      const energyDifference = Math.abs(current.outro_energy - next.intro_energy);
+      score += Math.max(-20, 24 - energyDifference * 60);
+    }
+
+    if (next.analysis_status === 'ready') score += 15;
 
     return score;
   }

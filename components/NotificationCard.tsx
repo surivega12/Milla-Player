@@ -8,12 +8,14 @@ interface NotificationCardProps {
   tracksNeedingRepair?: number;
   onOptimize?: () => void;
   isOptimizing?: boolean;
+  progressText?: string;
 }
 
 export const NotificationCard: React.FC<NotificationCardProps> = ({
   tracksNeedingRepair: propCount,
   onOptimize,
   isOptimizing = false,
+  progressText,
 }) => {
   const [internalCount, setInternalCount] = useState<number>(0);
   const [loading, setLoading] = useState<boolean>(false);
@@ -87,6 +89,12 @@ export const NotificationCard: React.FC<NotificationCardProps> = ({
           ¿Deseas optimizar tu biblioteca offline? El motor acústico de VERTEX calculará BPM, Tono Camelot y puntos de mezcla armónica automáticamente.
         </Text>
 
+        {isOptimizing && progressText ? (
+          <Text className="text-xs text-white font-semibold mt-3" numberOfLines={2}>
+            {progressText}
+          </Text>
+        ) : null}
+
         <TouchableOpacity
           onPress={onOptimize}
           disabled={isOptimizing}
@@ -100,7 +108,7 @@ export const NotificationCard: React.FC<NotificationCardProps> = ({
             <Zap size={16} color="#000000" fill="#000000" />
           )}
           <Text className="text-xs font-black uppercase tracking-wider text-black">
-            {isOptimizing ? 'Optimizando Biblioteca...' : 'Optimizar Ahora'}
+            {isOptimizing ? 'Analizando...' : 'Optimizar Ahora'}
           </Text>
         </TouchableOpacity>
       </View>

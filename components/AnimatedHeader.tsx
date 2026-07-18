@@ -3,6 +3,7 @@ import { View, Text, TouchableOpacity, StyleSheet, Platform } from 'react-native
 import Animated, { useAnimatedStyle, useAnimatedReaction, runOnJS, SharedValue } from 'react-native-reanimated';
 import { Search, MoreVertical } from 'lucide-react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useTheme } from '../context/ThemeContext';
 
 export interface AnimatedHeaderProps {
   title: string;
@@ -15,6 +16,7 @@ export interface AnimatedHeaderProps {
 const WebAnimatedHeader: React.FC<AnimatedHeaderProps & { HEADER_HEIGHT: number }> = ({
   title, headerTranslationY, onOpenSidebar, onSearchPress, HEADER_HEIGHT
 }) => {
+  const { colors } = useTheme();
   const containerRef = useRef<any>(null);
 
   // Subscribe to changes on the worklet thread and push to DOM
@@ -38,21 +40,20 @@ const WebAnimatedHeader: React.FC<AnimatedHeaderProps & { HEADER_HEIGHT: number 
       ref={containerRef}
       style={[
         styles.container,
-        { paddingTop: 0, height: HEADER_HEIGHT, zIndex: 10 },
+        { paddingTop: 0, height: HEADER_HEIGHT, zIndex: 10, backgroundColor: colors.card, borderBottomColor: colors.border, borderBottomWidth: StyleSheet.hairlineWidth },
         // @ts-ignore — web-only transition
         { transition: 'transform 0.1s ease-out, opacity 0.1s ease-out' },
       ]}
-      className="bg-[rgba(15,15,15,0.88)] border-b border-white/10"
     >
       <View style={{ flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16 }}>
         <TouchableOpacity onPress={onSearchPress} activeOpacity={0.7} style={{ width: 40, height: 40, alignItems: 'center', justifyContent: 'center' }}>
-          <Search size={22} color="#E5E7EB" />
+          <Search size={22} color={colors.foreground} />
         </TouchableOpacity>
         <View style={StyleSheet.absoluteFill} pointerEvents="none" className="items-center justify-center">
-          <Text style={{ color: '#fff', fontSize: 18, fontWeight: '600', letterSpacing: 0.3 }}>{title}</Text>
+          <Text style={{ color: colors.foreground, fontSize: 18, fontWeight: '600', letterSpacing: 0 }}>{title}</Text>
         </View>
         <TouchableOpacity onPress={onOpenSidebar} activeOpacity={0.7} style={{ width: 40, height: 40, alignItems: 'center', justifyContent: 'center' }}>
-          <MoreVertical size={22} color="#E5E7EB" />
+          <MoreVertical size={22} color={colors.foreground} />
         </TouchableOpacity>
       </View>
     </View>
@@ -65,6 +66,7 @@ export const AnimatedHeader: React.FC<AnimatedHeaderProps> = ({
   onOpenSidebar, 
   onSearchPress 
 }) => {
+  const { colors } = useTheme();
   const insets = useSafeAreaInsets();
   const HEADER_HEIGHT = 60 + insets.top;
 
@@ -93,19 +95,18 @@ export const AnimatedHeader: React.FC<AnimatedHeaderProps> = ({
       style={[
         headerStyle, 
         styles.container, 
-        { paddingTop: insets.top, height: HEADER_HEIGHT }
+        { paddingTop: insets.top, height: HEADER_HEIGHT, backgroundColor: colors.card, borderBottomColor: colors.border, borderBottomWidth: StyleSheet.hairlineWidth }
       ]} 
-      className="bg-[rgba(15,15,15,0.88)] border-b border-white/10"
     >
       <View className="flex-1 flex-row items-center justify-between px-4">
         <TouchableOpacity onPress={onSearchPress} activeOpacity={0.7} className="w-10 h-10 items-center justify-center">
-          <Search size={22} color="#E5E7EB" />
+          <Search size={22} color={colors.foreground} />
         </TouchableOpacity>
         <View style={StyleSheet.absoluteFill} className="items-center justify-center" pointerEvents="none">
-          <Text className="text-white text-xl font-semibold tracking-wide">{title}</Text>
+          <Text className="text-xl font-semibold" style={{ color: colors.foreground }}>{title}</Text>
         </View>
         <TouchableOpacity onPress={onOpenSidebar} activeOpacity={0.7} className="w-10 h-10 items-center justify-center">
-          <MoreVertical size={22} color="#E5E7EB" />
+          <MoreVertical size={22} color={colors.foreground} />
         </TouchableOpacity>
       </View>
     </Animated.View>

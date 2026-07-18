@@ -30,7 +30,6 @@ import {
   MicVocal,
   Music2,
   Clock,
-  Heart,
   List,
   SkipBack,
   SkipForward,
@@ -46,9 +45,13 @@ import TrackPlayer, { useProgress } from 'react-native-track-player';
 import { getColors } from 'react-native-image-colors';
 
 import { getThemeColors } from '../utils/theme-colors';
-import { parseLrc, LyricLine } from '../utils/lyrics';
+import { parseLrc, lrcToWaveTtml, LyricLine } from '../utils/lyrics';
 import { Track } from '../components/PlayerBar';
 import LyricsWaveDom from '../components/LyricsWaveDom';
+import { extractMetadata } from '../services/metadata-service';
+import { sanitizeTrackUriForPlayback } from '../services/library-service';
+import { getCachedTrackById, updateTrackAnalysis } from '../services/database-service';
+import { LiquidHeartButton } from '../components/LiquidHeartButton';
 
 const { height } = Dimensions.get('window');
 
@@ -163,6 +166,8 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
   const [waveReloadNonce, setWaveReloadNonce] = useState(0);
   const [timingOffsetMs, setTimingOffsetMs] = useState(0);
   const [seekDraft, setSeekDraft] = useState<number | null>(null);
+  const [resolvedLyrics, setResolvedLyrics] = useState<Partial<Track>>({});
+  const [waveUnavailable, setWaveUnavailable] = useState(false);
 
   // 1. Consumir hook de progreso de react-native-track-player (frecuencia 100ms para precisión milimétrica)
   const { position: progressSec, duration: nativeDuration } = useProgress(500);
@@ -173,6 +178,61 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
     if (!track || !track.duration) return 0;
     return Math.max(0, progress * track.duration + timingOffsetMs / 1000);
   }, [progressSec, nativeDuration, track, progress, timingOffsetMs]);
+
+  useEffect(() => {
+    setResolvedLyrics({});
+    setWaveUnavailable(false);
+    if (!isOpen || !track?.url) return;
+    if (track.lyrics_ttml || track.lyrics_lrc || track.lyrics_plain || track.lyrics) return;
+    let cancelled = false;
+    const hydrateEmbeddedLyrics = async () => {
+      const cachedTrack = await getCachedTrackById(track.id).catch(() => null);
+      const cachedLyrics: Partial<Track> = {
+        lyrics_ttml: cachedTrack?.lyrics_ttml,
+        lyrics_lrc: cachedTrack?.lyrics_lrc,
+        lyrics_plain: cachedTrack?.lyrics_plain,
+        lyrics_json: cachedTrack?.lyrics_json,
+        lyrics_source: cachedTrack?.lyrics_source,
+      };
+      if (
+        cachedLyrics.lyrics_ttml || cachedLyrics.lyrics_lrc ||
+        cachedLyrics.lyrics_plain || cachedLyrics.lyrics_json
+      ) {
+        if (!cancelled) setResolvedLyrics(cachedLyrics);
+        return;
+      }
+      const metadata = await extractMetadata(
+        sanitizeTrackUriForPlayback(track.url || track.id),
+        track.id,
+        false
+      );
+      const lyricsUpdate: Partial<Track> = {
+        lyrics_ttml: metadata.lyrics_ttml,
+        lyrics_lrc: metadata.lyrics_lrc,
+        lyrics_plain: metadata.lyrics_plain,
+        lyrics_source: metadata.lyrics_source,
+      };
+      if (!cancelled && (lyricsUpdate.lyrics_ttml || lyricsUpdate.lyrics_lrc || lyricsUpdate.lyrics_plain)) {
+        setResolvedLyrics(lyricsUpdate);
+        await updateTrackAnalysis(track.id, lyricsUpdate).catch(() => false);
+      }
+    };
+    hydrateEmbeddedLyrics().catch(() => {});
+    return () => { cancelled = true; };
+  }, [isOpen, track?.id, track?.url]);
+
+  const effectiveLyricsTtml = resolvedLyrics.lyrics_ttml || track?.lyrics_ttml;
+  const effectiveLyricsLrc = resolvedLyrics.lyrics_lrc || track?.lyrics_lrc || track?.lyrics;
+  const effectiveLyricsPlain = resolvedLyrics.lyrics_plain || track?.lyrics_plain;
+  const effectiveLyricsJson = resolvedLyrics.lyrics_json || track?.lyrics_json;
+  const effectiveLyricsSource = resolvedLyrics.lyrics_source || track?.lyrics_source;
+  const waveTtml = useMemo(() => {
+    if (effectiveLyricsTtml) return effectiveLyricsTtml;
+    if (effectiveLyricsLrc) {
+      return lrcToWaveTtml(effectiveLyricsLrc, (nativeDuration || track?.duration || 0) * 1000);
+    }
+    return undefined;
+  }, [effectiveLyricsLrc, effectiveLyricsTtml, nativeDuration, track?.duration]);
 
   // 2. Extraer el color vibrante de la carátula activa para el Glassmorphism y Highlights
   const imageUrl = track?.artwork_thumb || track?.artwork;
@@ -210,11 +270,11 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
     if (!track) return [];
 
     // A. Verificar si existe la estructura JSON ya calculada en SQLite o Django
-    if (track.lyrics_json) {
+    if (effectiveLyricsJson) {
       try {
-        const parsedJson = typeof track.lyrics_json === 'string'
-          ? JSON.parse(track.lyrics_json)
-          : track.lyrics_json;
+        const parsedJson = typeof effectiveLyricsJson === 'string'
+          ? JSON.parse(effectiveLyricsJson)
+          : effectiveLyricsJson;
         if (Array.isArray(parsedJson) && parsedJson.length > 0) {
           return parsedJson.map((l: any) => ({
             time: Number(l.time || 0),
@@ -227,13 +287,14 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
     }
 
     // B. Fallback a parsear el formato .lrc en bruto
-    const rawLrc = track.lyrics_lrc || (track as any).lyrics || '';
-    return parseLrc(rawLrc);
-  }, [track]);
+    const rawLyrics = effectiveLyricsLrc || effectiveLyricsPlain || '';
+    return parseLrc(rawLyrics);
+  }, [track, effectiveLyricsJson, effectiveLyricsLrc, effectiveLyricsPlain]);
 
   // 4. Determinar la línea activa exactamente al milisegundo / segundo de reproducción
   const activeLineIndex = useMemo(() => {
     if (lyricLines.length === 0) return -1;
+    if (lyricLines[0].time < 0) return -1;
     for (let i = lyricLines.length - 1; i >= 0; i--) {
       const lineTimeSec = lyricLines[i].time > 10000
         ? lyricLines[i].time / 1000
@@ -282,6 +343,11 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
       setSeekDraft(null);
     }
   }, [onSeekToTime]);
+
+  const handleWaveUnavailable = useCallback(async () => {
+    setWaveUnavailable(true);
+    if (lyricLines.length > 0) setWaveMode(false);
+  }, [lyricLines.length]);
 
   const cycleTimingOffset = () => {
     setTimingOffsetMs((current) => current === 0 ? 250 : current === 250 ? -250 : 0);
@@ -334,6 +400,11 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
                   {timingOffsetMs >= 0 ? '+' : ''}{(timingOffsetMs / 1000).toFixed(2)}s
                 </Text>
               </View>
+              <Text className="text-[10px] font-bold text-neutral-400 uppercase">
+                {waveTtml
+                  ? (effectiveLyricsSource?.startsWith('embedded') ? 'Archivo' : 'LRC local')
+                  : waveUnavailable ? 'Letra local' : 'LyricsPlus'}
+              </Text>
             </View>
 
             <View className="flex-row items-center gap-4">
@@ -366,6 +437,8 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
                 currentTimeMs={currentSeconds * 1000}
                 isPlaying={isPlaying}
                 highlightColor="#f6f4ef"
+                ttml={waveTtml}
+                onUnavailable={handleWaveUnavailable}
                 onSeek={handleSeekToLyric}
               />
             ) : lyricLines.length === 0 ? (
@@ -428,9 +501,7 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
               </View>
 
               <View className="flex-row items-center gap-3">
-                <TouchableOpacity onPress={onToggleLike || (() => {})} className="p-1">
-                  <Heart size={20} color={isLiked ? '#ef4444' : '#a3a3a3'} fill={isLiked ? '#ef4444' : 'transparent'} />
-                </TouchableOpacity>
+                <LiquidHeartButton liked={isLiked} onPress={onToggleLike} size={20} />
                 <TouchableOpacity onPress={onClose} className="p-1">
                   <MicVocal size={20} color="#fed7aa" />
                 </TouchableOpacity>

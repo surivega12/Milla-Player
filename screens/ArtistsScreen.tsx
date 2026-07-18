@@ -1,9 +1,11 @@
-import React, { useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import { View, Text, TouchableOpacity, Image, FlatList, Platform, Dimensions, StyleSheet } from "react-native";
 import Animated, { useSharedValue, useAnimatedScrollHandler } from "react-native-reanimated";
 import { User } from "lucide-react-native";
 import { Track } from "../components/PlayerBar";
 import { AnimatedHeader } from "../components/AnimatedHeader";
+import { CollectionDetailView } from "../components/CollectionDetailView";
+import { useTheme } from "../context/ThemeContext";
 
 const AnimatedFlatList = Animated.createAnimatedComponent(FlatList as any);
 const { width } = Dimensions.get("window");
@@ -23,7 +25,9 @@ interface ArtistEntry {
   tracks: Track[];
 }
 
-export const ArtistsScreen: React.FC<ArtistsScreenProps> = ({ tracks, onSelectTrack, onOpenSidebar }) => {
+export const ArtistsScreen: React.FC<ArtistsScreenProps> = ({ tracks, onOpenSidebar, currentTrackId }) => {
+  const { colors } = useTheme();
+  const [selectedArtist, setSelectedArtist] = useState<ArtistEntry | null>(null);
   const headerTranslationY = useSharedValue(0);
 
   const scrollHandler = useAnimatedScrollHandler({
@@ -46,22 +50,22 @@ export const ArtistsScreen: React.FC<ArtistsScreenProps> = ({ tracks, onSelectTr
     for (const track of tracks) {
       const name = (track.artist && track.artist !== "Unknown Artist" && track.artist !== "Local Library")
         ? track.artist : "Artista desconocido";
-      if (!map.has(name)) map.set(name, { name, artwork: track.artwork, trackCount: 0, tracks: [] });
+      if (!map.has(name)) map.set(name, { name, artwork: track.artwork_thumb || track.artwork, trackCount: 0, tracks: [] });
       const entry = map.get(name)!;
       entry.trackCount += 1;
       entry.tracks.push(track);
-      if (!entry.artwork && track.artwork) entry.artwork = track.artwork;
+      if (!entry.artwork && (track.artwork_thumb || track.artwork)) entry.artwork = track.artwork_thumb || track.artwork;
     }
     return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name, "es"));
   }, [tracks]);
 
   const renderArtist = ({ item }: { item: ArtistEntry }) => (
     <TouchableOpacity
-      onPress={() => item.tracks[0] && onSelectTrack(item.tracks[0])}
+      onPress={() => setSelectedArtist(item)}
       activeOpacity={0.8}
       style={{ width: CARD_WIDTH, marginBottom: 20 }}
     >
-      <View style={{ width: CARD_WIDTH, height: CARD_WIDTH, borderRadius: 16, backgroundColor: "#1c1c1e", borderWidth: 1, borderColor: "rgba(255,255,255,0.1)", overflow: "hidden", alignItems: "center", justifyContent: "center" }}>
+      <View style={{ width: CARD_WIDTH, height: CARD_WIDTH, borderRadius: 8, backgroundColor: colors.card, borderWidth: 1, borderColor: colors.border, overflow: "hidden", alignItems: "center", justifyContent: "center" }}>
         {item.artwork ? (
           <Image source={{ uri: item.artwork }} style={StyleSheet.absoluteFill} resizeMode="cover" />
         ) : (
@@ -69,14 +73,27 @@ export const ArtistsScreen: React.FC<ArtistsScreenProps> = ({ tracks, onSelectTr
         )}
       </View>
       <View style={{ marginTop: 8, paddingHorizontal: 4 }}>
-        <Text numberOfLines={1} style={{ color: "#fff", fontSize: 15, fontWeight: "700" }}>{item.name}</Text>
+        <Text numberOfLines={1} style={{ color: colors.foreground, fontSize: 15, fontWeight: "700" }}>{item.name}</Text>
         <Text style={{ color: "#9ca3af", fontSize: 12, fontWeight: "500", marginTop: 2 }}>{item.trackCount} {item.trackCount === 1 ? "canción" : "canciones"}</Text>
       </View>
     </TouchableOpacity>
   );
 
+  if (selectedArtist) {
+    return (
+      <CollectionDetailView
+        kind="artist"
+        title={selectedArtist.name}
+        artwork={selectedArtist.artwork}
+        tracks={selectedArtist.tracks}
+        currentTrackId={currentTrackId}
+        onBack={() => setSelectedArtist(null)}
+      />
+    );
+  }
+
   return (
-    <View style={{ flex: 1, backgroundColor: "#000" }}>
+    <View style={{ flex: 1, backgroundColor: colors.background }}>
       <AnimatedHeader title="Artistas" headerTranslationY={headerTranslationY} onOpenSidebar={onOpenSidebar} />
       {artists.length === 0 ? (
         <View style={{ flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: 32 }}>

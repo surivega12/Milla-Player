@@ -8,8 +8,11 @@ from rest_framework.response import Response
 from rest_framework import status
 from .services.lyrics_engine import LyricsEngine
 from .services.dsp_engine import DSPEngine
-from .models import LyricsCache, AudioAnalysisCache
-from .serializers import LyricsCacheSerializer, AudioAnalysisSerializer
+from .models import AudioAnalysisCache
+
+MAX_BATCH_TRACKS = 50
+MAX_DSP_UPLOAD_BYTES = int(os.environ.get('DSP_MAX_UPLOAD_BYTES', str(750 * 1024 * 1024)))
+SUPPORTED_AUDIO_SUFFIXES = {'.mp3', '.flac', '.wav', '.m4a', '.aac', '.ogg', '.opus', '.mp4', '.dsf', '.dff'}
 
 
 class LyricsEndpointView(APIView):
@@ -50,6 +53,11 @@ class LyricsEndpointView(APIView):
     def post(self, request, *args, **kwargs):
         tracks = request.data.get('tracks')
         if isinstance(tracks, list):
+            if len(tracks) > MAX_BATCH_TRACKS:
+                return Response(
+                    {"error": f"El lote no puede superar {MAX_BATCH_TRACKS} pistas."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             results = []
             for t in tracks:
                 title = (t.get('title') or '').strip()
@@ -113,14 +121,19 @@ class AudioDSPAnalyzeView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        serializer = AudioAnalysisSerializer(cached)
-        data = serializer.data
-        data["cached"] = True
-        return Response(data, status=status.HTTP_200_OK)
+        return Response(
+            DSPEngine._cached_payload(cached, track_id),
+            status=status.HTTP_200_OK
+        )
 
     def post(self, request, *args, **kwargs):
         tracks = request.data.get('tracks')
         if isinstance(tracks, list):
+            if len(tracks) > MAX_BATCH_TRACKS:
+                return Response(
+                    {"error": f"El lote no puede superar {MAX_BATCH_TRACKS} pistas."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             results = []
             for t in tracks:
                 track_id = str(t.get('track_id') or t.get('id') or '')
@@ -132,17 +145,7 @@ class AudioDSPAnalyzeView(APIView):
                     cached = AudioAnalysisCache.objects.filter(track_id=track_id).first()
 
                 if cached:
-                    results.append({
-                        "track_id": track_id or cached.track_id,
-                        "bpm": round(cached.bpm, 2),
-                        "camelot_key": cached.camelot_key,
-                        "vocal_silence_start_ms": cached.vocal_silence_start_ms,
-                        "vocal_silence_end_ms": cached.vocal_silence_end_ms,
-                        "intro_duration_ms": cached.intro_duration_ms,
-                        "outro_duration_ms": cached.outro_duration_ms,
-                        "cached": True,
-                        "success": True
-                    })
+                    results.append(DSPEngine._cached_payload(cached, track_id))
                 else:
                     # Sin audio real no se inventan valores: el cliente debe subir un archivo para analizarlo.
                     results.append({
@@ -153,7 +156,7 @@ class AudioDSPAnalyzeView(APIView):
                     })
             return Response({"results": results}, status=status.HTTP_200_OK)
 
-        track_id = request.data.get('track_id', 'unknown_track')
+        track_id = str(request.data.get('track_id', 'unknown_track'))[:255]
         audio_file = request.FILES.get('audio_file')
 
         if not audio_file:
@@ -162,11 +165,22 @@ class AudioDSPAnalyzeView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        if audio_file.size > MAX_DSP_UPLOAD_BYTES:
+            return Response(
+                {"error": "El archivo de audio supera el limite permitido para analisis."},
+                status=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
+            )
+
         # El nombre enviado por el cliente nunca se usa como ruta. Conservamos sólo una extensión
         # validada y un nombre seguro para evitar path traversal en el directorio temporal.
         safe_track_id = get_valid_filename(str(track_id))[:100] or 'unknown_track'
         safe_filename = get_valid_filename(Path(audio_file.name).name)[:120] or 'audio.mp3'
         suffix = Path(safe_filename).suffix.lower() or '.mp3'
+        if suffix not in SUPPORTED_AUDIO_SUFFIXES:
+            return Response(
+                {"error": "Formato de audio no compatible."},
+                status=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE
+            )
         temp_dir = os.path.join(tempfile.gettempdir(), 'vertex_dsp_uploads')
         os.makedirs(temp_dir, exist_ok=True)
         temp_path = os.path.join(temp_dir, f"upload_{safe_track_id}_{uuid.uuid4().hex}{suffix}")
@@ -177,7 +191,7 @@ class AudioDSPAnalyzeView(APIView):
                     dest.write(chunk)
 
             # Analizar el archivo temporal con DSPEngine
-            result = DSPEngine.analyze_fragment(temp_path, track_id=safe_track_id)
+            result = DSPEngine.analyze_fragment(temp_path, track_id=track_id)
 
             if os.path.exists(temp_path):
                 try:

@@ -3,6 +3,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import { getAudioMetadata } from '@missingcore/audio-metadata';
 
 export interface TrackMetadata {
+  duration?: number;
   title?: string;
   artist?: string;
   album?: string;
@@ -11,6 +12,100 @@ export interface TrackMetadata {
   key?: string;
   replayGainTrack?: number;
   replayGainAlbum?: number;
+  lyrics_lrc?: string;
+  lyrics_ttml?: string;
+  lyrics_plain?: string;
+  lyrics_source?: 'embedded_ttml' | 'embedded_lrc' | 'embedded_plain';
+}
+
+const hasLrcTimestamps = (value: string): boolean => /\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]/.test(value);
+
+function classifyEmbeddedLyrics(rawValue: unknown): Partial<TrackMetadata> {
+  const candidate = typeof rawValue === 'string'
+    ? rawValue
+    : (rawValue as any)?.lyrics ?? (rawValue as any)?.data ?? '';
+  const lyrics = String(candidate || '').replace(/\u0000/g, '').trim();
+  if (!lyrics) return {};
+  if (/<tt(?:\s|>)/i.test(lyrics) || /<ttml(?:\s|>)/i.test(lyrics)) {
+    return { lyrics_ttml: lyrics, lyrics_source: 'embedded_ttml' };
+  }
+  if (hasLrcTimestamps(lyrics)) {
+    return { lyrics_lrc: lyrics, lyrics_source: 'embedded_lrc' };
+  }
+  return { lyrics_plain: lyrics, lyrics_source: 'embedded_plain' };
+}
+
+function decodeBase64Bytes(value: string): Uint8Array {
+  const GlobalBuffer = (globalThis as any).Buffer;
+  if (GlobalBuffer?.from) return new Uint8Array(GlobalBuffer.from(value, 'base64'));
+  const binary = typeof atob === 'function' ? atob(value) : '';
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function decodeUtf8(bytes: Uint8Array): string {
+  const GlobalBuffer = (globalThis as any).Buffer;
+  if (GlobalBuffer?.from) return GlobalBuffer.from(bytes).toString('utf8');
+  if (typeof TextDecoder !== 'undefined') return new TextDecoder('utf-8').decode(bytes);
+  let encoded = '';
+  for (const byte of bytes) encoded += `%${byte.toString(16).padStart(2, '0')}`;
+  try { return decodeURIComponent(encoded); } catch { return ''; }
+}
+
+async function readBytes(fileUri: string, position: number, length: number): Promise<Uint8Array> {
+  const base64 = await FileSystem.readAsStringAsync(fileUri, {
+    encoding: FileSystem.EncodingType.Base64,
+    position,
+    length,
+  });
+  return decodeBase64Bytes(base64);
+}
+
+async function readFlacEmbeddedLyrics(fileUri: string): Promise<Partial<TrackMetadata>> {
+  if (!fileUri.split('?')[0].toLowerCase().endsWith('.flac')) return {};
+  try {
+    const signature = decodeUtf8(await readBytes(fileUri, 0, 4));
+    if (signature !== 'fLaC') return {};
+    let offset = 4;
+    for (let blockIndex = 0; blockIndex < 64; blockIndex++) {
+      const header = await readBytes(fileUri, offset, 4);
+      if (header.length < 4) break;
+      const isLast = Boolean(header[0] & 0x80);
+      const blockType = header[0] & 0x7f;
+      const blockLength = (header[1] << 16) | (header[2] << 8) | header[3];
+      if (blockType === 4 && blockLength > 8 && blockLength <= 4 * 1024 * 1024) {
+        const block = await readBytes(fileUri, offset + 4, blockLength);
+        const view = new DataView(block.buffer, block.byteOffset, block.byteLength);
+        let cursor = 0;
+        const vendorLength = view.getUint32(cursor, true);
+        cursor += 4 + vendorLength;
+        if (cursor + 4 > block.length) return {};
+        const commentCount = Math.min(view.getUint32(cursor, true), 10000);
+        cursor += 4;
+        const comments = new Map<string, string>();
+        for (let index = 0; index < commentCount && cursor + 4 <= block.length; index++) {
+          const commentLength = view.getUint32(cursor, true);
+          cursor += 4;
+          if (commentLength < 0 || cursor + commentLength > block.length) break;
+          const comment = decodeUtf8(block.subarray(cursor, cursor + commentLength));
+          cursor += commentLength;
+          const separator = comment.indexOf('=');
+          if (separator > 0) comments.set(comment.slice(0, separator).toUpperCase(), comment.slice(separator + 1));
+        }
+        for (const key of ['TTML', 'LYRICS_SYNCED', 'SYNCEDLYRICS', 'LYRICS', 'UNSYNCEDLYRICS']) {
+          const value = comments.get(key);
+          if (value?.trim()) return classifyEmbeddedLyrics(value);
+        }
+        return {};
+      }
+      offset += 4 + blockLength;
+      if (isLast) break;
+    }
+  } catch (error) {
+    console.warn(`[MetadataService] No se pudieron leer letras Vorbis/FLAC de ${fileUri}:`, error);
+  }
+  return {};
 }
 
 /**
@@ -66,7 +161,9 @@ async function byteArrayToBase64NonBlocking(data: number[] | Uint8Array, format:
  */
 async function saveCoverToDisk(base64Image: string, trackId: string): Promise<string | null> {
   try {
-    const coversDir = `${FileSystem.cacheDirectory}covers/`;
+    const baseDirectory = FileSystem.documentDirectory || FileSystem.cacheDirectory;
+    if (!baseDirectory) return null;
+    const coversDir = `${baseDirectory}covers/`;
     const dirInfo = await FileSystem.getInfoAsync(coversDir);
     if (!dirInfo.exists) {
       await FileSystem.makeDirectoryAsync(coversDir, { intermediates: true });
@@ -89,14 +186,21 @@ async function saveCoverToDisk(base64Image: string, trackId: string): Promise<st
   }
 }
 
-async function extractMetadataByChunks(fileUri: string, trackId?: string): Promise<TrackMetadata> {
+async function extractMetadataByChunks(
+  fileUri: string,
+  trackId?: string,
+  includeArtwork = true
+): Promise<TrackMetadata> {
   const cleanUri = fileUri.split('?')[0].toLowerCase();
   if (!cleanUri.endsWith('.flac') && !cleanUri.endsWith('.mp3') && !cleanUri.endsWith('.m4a') && !cleanUri.endsWith('.mp4')) {
     return {};
   }
 
+  const requestedFields = includeArtwork
+    ? ['name', 'artist', 'album', 'artwork'] as const
+    : ['name', 'artist', 'album'] as const;
   const response = await Promise.race([
-    getAudioMetadata(fileUri, ['name', 'artist', 'album', 'artwork'] as const),
+    getAudioMetadata(fileUri, requestedFields),
     new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
   ]);
   if (!response) return {};
@@ -107,7 +211,7 @@ async function extractMetadataByChunks(fileUri: string, trackId?: string): Promi
     artist: tags.artist?.trim(),
     album: tags.album?.trim(),
   };
-  if (tags.artwork) {
+  if (includeArtwork && tags.artwork) {
     const targetId = trackId || fileUri.split('/').pop()?.split('?')[0] || fileUri;
     metadata.artwork_thumb = (await saveCoverToDisk(tags.artwork, targetId)) || undefined;
   }
@@ -118,7 +222,98 @@ async function extractMetadataByChunks(fileUri: string, trackId?: string): Promi
  * Extrae los metadatos ID3 / Vorbis / FLAC de una pista de audio local.
  * Implementa timeout defensivo y captura total de excepciones para prevenir bloqueos o caídas (undefined is not a function).
  */
-export const extractMetadata = async (fileUri: string, trackId?: string): Promise<TrackMetadata> => {
+async function readJsMediaTags(
+  fileUri: string,
+  trackId?: string,
+  includePicture = false
+): Promise<TrackMetadata> {
+  const readPromise = new Promise<TrackMetadata>((resolve) => {
+    try {
+      const Reader = (jsmediatags as any)?.Reader;
+      if (!Reader) return resolve({});
+      const reader = new Reader(fileUri).setTagsToRead([
+        'title', 'artist', 'album', 'lyrics', 'TBPM', 'TKEY', 'TXXX', 'tmpo',
+        ...(includePicture ? ['picture'] : []),
+      ]);
+      reader.read({
+        onSuccess: async (tag: any) => {
+          try {
+            const tags = tag?.tags ?? {};
+            const metadata: TrackMetadata = {};
+            if (typeof tags.title === 'string') metadata.title = tags.title.trim();
+            if (typeof tags.artist === 'string') metadata.artist = tags.artist.trim();
+            if (typeof tags.album === 'string') metadata.album = tags.album.trim();
+
+            const rawBpm = tags.TBPM?.data ?? tags.tmpo?.data ?? tags.tmpo;
+            const parsedBpm = Number.parseFloat(String(rawBpm ?? ''));
+            if (Number.isFinite(parsedBpm) && parsedBpm > 20 && parsedBpm < 350) metadata.bpm = parsedBpm;
+            if (tags.TKEY?.data) metadata.key = String(tags.TKEY.data).trim();
+
+            const txxxFrames = tags.TXXX ? (Array.isArray(tags.TXXX) ? tags.TXXX : [tags.TXXX]) : [];
+            for (const frame of txxxFrames) {
+              const description = String(frame.user_description || frame.description || '').toUpperCase();
+              const numericValue = Number.parseFloat(String(frame.data ?? '').replace(/[^0-9.-]+/g, ''));
+              if (!Number.isFinite(numericValue)) continue;
+              if (description === 'REPLAYGAIN_TRACK_GAIN') metadata.replayGainTrack = numericValue;
+              if (description === 'REPLAYGAIN_ALBUM_GAIN') metadata.replayGainAlbum = numericValue;
+            }
+
+            Object.assign(metadata, classifyEmbeddedLyrics(tags.lyrics ?? tags.USLT ?? tags['©lyr']));
+            if (includePicture && tags.picture?.data) {
+              const base64Data = await byteArrayToBase64NonBlocking(
+                tags.picture.data,
+                tags.picture.format || 'image/jpeg'
+              );
+              const targetId = trackId || fileUri.split('/').pop()?.split('?')[0] || fileUri;
+              metadata.artwork_thumb = (await saveCoverToDisk(base64Data, targetId)) || undefined;
+            }
+            resolve(metadata);
+          } catch (error) {
+            console.warn(`[MetadataService] Error procesando etiquetas de ${fileUri}:`, error);
+            resolve({});
+          }
+        },
+        onError: () => resolve({}),
+      });
+    } catch (error) {
+      console.warn(`[MetadataService] Lector ID3/MP4 no disponible para ${fileUri}:`, error);
+      resolve({});
+    }
+  });
+  return Promise.race([
+    readPromise,
+    new Promise<TrackMetadata>((resolve) => setTimeout(() => resolve({}), includePicture ? 3500 : 2200)),
+  ]);
+}
+
+export const extractMetadata = async (
+  fileUri: string,
+  trackId?: string,
+  includeArtwork = true
+): Promise<TrackMetadata> => {
+  try {
+    const [chunkedMetadata, tagMetadata, flacLyrics] = await Promise.all([
+      extractMetadataByChunks(fileUri, trackId, includeArtwork).catch(() => ({})),
+      readJsMediaTags(fileUri, trackId, false),
+      readFlacEmbeddedLyrics(fileUri),
+    ]);
+    let metadata: TrackMetadata = { ...tagMetadata, ...chunkedMetadata, ...flacLyrics };
+    if (includeArtwork && !metadata.artwork_thumb) {
+      const pictureFallback = await readJsMediaTags(fileUri, trackId, true);
+      metadata = {
+        ...pictureFallback,
+        ...metadata,
+        artwork_thumb: metadata.artwork_thumb || pictureFallback.artwork_thumb,
+      };
+    }
+    return metadata;
+  } catch (error) {
+    console.warn(`[MetadataService] Excepcion global para ${fileUri}:`, error);
+    return {};
+  }
+};
+
+const extractMetadataLegacy = async (fileUri: string, trackId?: string): Promise<TrackMetadata> => {
   try {
     try {
       const chunkedMetadata = await extractMetadataByChunks(fileUri, trackId);

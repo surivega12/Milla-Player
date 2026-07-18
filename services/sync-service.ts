@@ -1,14 +1,16 @@
 /**
- * Punto 3.1: Worker de Sincronización en Segundo Plano (React Native / El Celular)
- * 
- * Sincroniza metadatos pesados (Letras LRC/JSON, BPM de Librosa y Tonalidad de Camelot)
- * desde el backend de Django hacia la base de datos local SQLite (`milla.db`),
- * protegiendo los datos móviles mediante comprobación estricta de Wi-Fi y lotes asíncronos que no congelan la UI.
+ * Metadata and DSP synchronization.
+ *
+ * Startup only asks the server for cached data. Sending local audio is an
+ * explicit, sequential operation so a large library never blocks the JS thread
+ * or consumes mobile data without the user asking for it.
  */
+import * as FileSystem from 'expo-file-system/legacy';
 import * as Network from 'expo-network';
 import { Platform } from 'react-native';
-import { getTracksNeedingSync, updateTrackAnalysis } from './database-service';
 import { Track } from '../components/PlayerBar';
+import { getTracksNeedingSync, updateTrackAnalysis } from './database-service';
+import { isUnresolvedSafUri, sanitizeTrackUriForPlayback } from './library-service';
 
 export interface SyncOptions {
   batchSize?: number;
@@ -24,16 +26,36 @@ export interface SyncResult {
   errors?: string[];
 }
 
-// Configuración por defecto del servidor Django (se puede sobreescribir vía variables de entorno o config local)
-const DEFAULT_BACKEND_URL = 'http://10.0.2.2:8000'; // IP estándar para emulador Android local o red de casa
+export interface AnalysisProgress {
+  current: number;
+  total: number;
+  trackId: string;
+  title: string;
+  phase: 'preparing' | 'uploading' | 'analyzing' | 'saved' | 'failed';
+  uploadProgress: number;
+}
 
-/**
- * Comprueba si el dispositivo está conectado a una red Wi-Fi activa.
- * Si detecta conexión móvil (cellular) y no se forzó lo contrario, aborta para no gastar megas del usuario.
- */
+export interface AnalyzeLibraryOptions extends SyncOptions {
+  onProgress?: (progress: AnalysisProgress) => void;
+  shouldCancel?: () => boolean;
+}
+
+type AnalysisUpdate = Parameters<typeof updateTrackAnalysis>[1];
+
+const DEFAULT_BACKEND_URL = 'http://10.0.2.2:8000';
 const CONFIGURED_BACKEND_URL = (
   process.env.EXPO_PUBLIC_MILLA_API_URL || (__DEV__ ? DEFAULT_BACKEND_URL : '')
 ).replace(/\/$/, '');
+
+function hasStoredLyrics(track: Track): boolean {
+  return Boolean(
+    String(track.lyrics_ttml || '').trim() ||
+    String(track.lyrics_lrc || '').trim() ||
+    String(track.lyrics_plain || '').trim() ||
+    String(track.lyrics_json || '').trim() ||
+    String(track.lyrics || '').trim()
+  );
+}
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number = 8000): Promise<Response> {
   const controller = new AbortController();
@@ -45,204 +67,243 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
-export const checkCanSync = async (forceOnCellular: boolean = false): Promise<{ canSync: boolean; reason?: string }> => {
+export const checkCanSync = async (
+  forceOnCellular: boolean = false
+): Promise<{ canSync: boolean; reason?: string }> => {
   if (Platform.OS === 'web') return { canSync: false, reason: 'ENTORNO_WEB' };
   try {
     const networkState = await Network.getNetworkStateAsync();
-
     if (!networkState.isConnected || !networkState.isInternetReachable) {
       return { canSync: false, reason: 'SIN_INTERNET' };
     }
-
     if (networkState.type === Network.NetworkStateType.CELLULAR && !forceOnCellular) {
-      console.log('[SyncService] Conexión celular detectada. Sincronización abortada para proteger datos móviles.');
       return { canSync: false, reason: 'DATOS_MOVILES_DETECTADOS' };
     }
-
-    if (networkState.type !== Network.NetworkStateType.WIFI && !forceOnCellular && networkState.type !== Network.NetworkStateType.ETHERNET) {
+    if (
+      networkState.type !== Network.NetworkStateType.WIFI &&
+      networkState.type !== Network.NetworkStateType.ETHERNET &&
+      !forceOnCellular
+    ) {
       return { canSync: false, reason: 'NO_ES_WIFI' };
     }
-
     return { canSync: true };
   } catch (error) {
-    console.warn('[SyncService] Error verificando estado de red con expo-network, permitiendo si hay conexión local:', error);
-    return { canSync: true };
+    console.warn('[SyncService] No se pudo consultar el tipo de red:', error);
+    return { canSync: false, reason: 'RED_NO_VERIFICADA' };
   }
 };
 
-/**
- * Ejecuta el ciclo de sincronización por lote (Batch) en segundo plano o al iniciar la app.
- * Utiliza pausas no bloqueantes (yielding) para mantener el refresco de 120 FPS en el hilo de UI.
- */
+function mapLyricsResult(item: any): AnalysisUpdate {
+  if (!item?.success) return {};
+  const update: AnalysisUpdate = {};
+  if (item.lyrics_lrc) update.lyrics_lrc = String(item.lyrics_lrc);
+  if (item.lyrics_json && (typeof item.lyrics_json === 'string' || item.lyrics_json.length > 0)) {
+    update.lyrics_json = typeof item.lyrics_json === 'string'
+      ? item.lyrics_json
+      : JSON.stringify(item.lyrics_json);
+  }
+  if (update.lyrics_lrc || update.lyrics_json) {
+    update.lyrics_source = String(item.source || 'api');
+  }
+  return update;
+}
+
+function mapDspResult(item: any): AnalysisUpdate {
+  if (!item?.success) return {};
+  const update: AnalysisUpdate = { analysis_status: 'ready' };
+  const durationMs = Number(item.duration_ms);
+  if (Number.isFinite(durationMs) && durationMs > 0) {
+    update.duration = Math.round(durationMs) / 1000;
+  }
+  const numericFields: Array<keyof AnalysisUpdate> = [
+    'bpm',
+    'vocal_silence_start_ms',
+    'vocal_silence_end_ms',
+    'intro_duration_ms',
+    'outro_duration_ms',
+    'outro_start_ms',
+    'intro_energy',
+    'outro_energy',
+    'beat_interval_ms',
+  ];
+  for (const field of numericFields) {
+    if (item[field] !== undefined && item[field] !== null && Number.isFinite(Number(item[field]))) {
+      (update as Record<string, unknown>)[field] = Number(item[field]);
+    }
+  }
+  if (item.camelot_key) update.camelot_key = String(item.camelot_key);
+  update.analysis_version = String(item.analysis_version || 'milla-dsp-2');
+  return update;
+}
+
+function mimeTypeForUri(uri: string): string {
+  const extension = uri.split('?')[0].split('.').pop()?.toLowerCase();
+  const mimeTypes: Record<string, string> = {
+    mp3: 'audio/mpeg',
+    flac: 'audio/flac',
+    wav: 'audio/wav',
+    m4a: 'audio/mp4',
+    aac: 'audio/aac',
+    ogg: 'audio/ogg',
+    opus: 'audio/opus',
+  };
+  return mimeTypes[extension || ''] || 'application/octet-stream';
+}
+
+export async function uploadTrackForAnalysis(
+  track: Track,
+  backendUrl: string = CONFIGURED_BACKEND_URL,
+  onUploadProgress?: (progress: number) => void
+): Promise<{ success: boolean; data?: any; reason?: string }> {
+  if (Platform.OS === 'web') return { success: false, reason: 'ENTORNO_WEB' };
+  if (!backendUrl) return { success: false, reason: 'BACKEND_NO_CONFIGURADO' };
+
+  const fileUri = sanitizeTrackUriForPlayback(track.url || track.id);
+  if (!fileUri || fileUri.startsWith('http') || fileUri.startsWith('content://') || isUnresolvedSafUri(fileUri)) {
+    return { success: false, reason: 'RUTA_LOCAL_NO_ACCESIBLE' };
+  }
+
+  const fileInfo = await FileSystem.getInfoAsync(fileUri).catch(() => null);
+  if (!fileInfo?.exists || fileInfo.isDirectory) {
+    return { success: false, reason: 'ARCHIVO_NO_ENCONTRADO' };
+  }
+
+  const cleanUrl = backendUrl.replace(/\/$/, '');
+  const task = FileSystem.createUploadTask(
+    `${cleanUrl}/api/analyze/`,
+    fileUri,
+    {
+      httpMethod: 'POST',
+      uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+      fieldName: 'audio_file',
+      mimeType: mimeTypeForUri(fileUri),
+      parameters: {
+        track_id: String(track.id),
+        title: track.title || '',
+        artist: track.artist || '',
+      },
+      sessionType: FileSystem.FileSystemSessionType.FOREGROUND,
+    },
+    ({ totalBytesExpectedToSend, totalBytesSent }) => {
+      if (totalBytesExpectedToSend > 0) {
+        onUploadProgress?.(Math.min(1, totalBytesSent / totalBytesExpectedToSend));
+      }
+    }
+  );
+
+  const response = await task.uploadAsync();
+  if (!response || response.status < 200 || response.status >= 300) {
+    return { success: false, reason: `HTTP_${response?.status || 0}` };
+  }
+  try {
+    const data = JSON.parse(response.body || '{}');
+    return data?.success
+      ? { success: true, data }
+      : { success: false, data, reason: data?.reason || 'ANALISIS_SIN_RESULTADO' };
+  } catch {
+    return { success: false, reason: 'RESPUESTA_INVALIDA' };
+  }
+}
+
+/** Fetches only cached metadata. It never uploads audio in the background. */
 export const startBackgroundSync = async (options: SyncOptions = {}): Promise<SyncResult> => {
   const batchSize = options.batchSize ?? 15;
   const backendUrl = (options.backendUrl ?? CONFIGURED_BACKEND_URL).replace(/\/$/, '');
-  const forceOnCellular = options.forceOnCellular ?? false;
-
-  const result: SyncResult = {
-    success: false,
-    syncedCount: 0,
-    failedCount: 0,
-    errors: [],
-  };
+  const result: SyncResult = { success: false, syncedCount: 0, failedCount: 0, errors: [] };
 
   if (!backendUrl) {
     result.reason = 'BACKEND_NO_CONFIGURADO';
     return result;
   }
-
-  // 1. Verificación estricta de Wi-Fi
-  const networkCheck = await checkCanSync(forceOnCellular);
+  const networkCheck = await checkCanSync(options.forceOnCellular ?? false);
   if (!networkCheck.canSync) {
     result.reason = networkCheck.reason;
     return result;
   }
 
   try {
-    // 2. Buscar en SQLite pistas pendientes de sincronización (needs_sync == 1 o sin BPM/Letras)
-    const pendingTracks: Track[] = await getTracksNeedingSync(batchSize);
-
+    const pendingTracks = await getTracksNeedingSync(batchSize);
     if (pendingTracks.length === 0) {
-      result.success = true;
-      result.reason = 'BIBLIOTECA_AL_DIA';
-      return result;
+      return { ...result, success: true, reason: 'BIBLIOTECA_AL_DIA' };
     }
 
-    console.log(`[SyncService] Iniciando sincronización por lotes para ${pendingTracks.length} pistas en Wi-Fi...`);
-
-    // 3. Empaquetar pistas (Título, Artista, Álbum, ID) y hacer llamadas POST en lote
-    const payloadTracks = pendingTracks.map(t => ({
-      track_id: t.id,
-      id: t.id,
-      title: t.title,
-      artist: t.artist,
-      album: t.album ?? '',
-      duration: t.duration ?? 0,
-      bpm: t.bpm ?? null,
-      camelot_key: t.camelot_key ?? null,
+    const payloadTracks = pendingTracks.map((track) => ({
+      track_id: track.id,
+      id: track.id,
+      title: track.title,
+      artist: track.artist,
+      album: track.album ?? '',
+      duration: track.duration ?? 0,
     }));
+    const lyricsPayloadTracks = payloadTracks.filter((_, index) => !hasStoredLyrics(pendingTracks[index]));
 
-    // A. Consultar endpoint en lote para Letras (/api/lyrics/)
-    let lyricsResultsMap: Record<string, any> = {};
-    try {
-      const lyricsResp = await fetchWithTimeout(`${backendUrl}/api/lyrics/`, {
+    const [lyricsResponse, dspResponse] = await Promise.all([
+      lyricsPayloadTracks.length > 0
+        ? fetchWithTimeout(`${backendUrl}/api/lyrics/`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tracks: lyricsPayloadTracks }),
+          }, 12000).catch(() => null)
+        : Promise.resolve(null),
+      fetchWithTimeout(`${backendUrl}/api/analyze/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tracks: payloadTracks }),
-      });
-      if (lyricsResp.ok) {
-        const lyricsData = await lyricsResp.json();
-        const resultsArray = lyricsData?.results ?? [];
-        for (const item of resultsArray) {
-          if (item?.track_id && item.success) {
-            lyricsResultsMap[item.track_id] = item;
-          }
-        }
-      }
-    } catch (e) {
-      console.warn('[SyncService] Advertencia en batch /api/lyrics/:', e);
+      }, 12000).catch(() => null),
+    ]);
+
+    const lyricsById: Record<string, any> = {};
+    const dspById: Record<string, any> = {};
+    if (lyricsResponse?.ok) {
+      const data = await lyricsResponse.json();
+      for (const item of data?.results || []) if (item?.track_id) lyricsById[item.track_id] = item;
+    }
+    if (dspResponse?.ok) {
+      const data = await dspResponse.json();
+      for (const item of data?.results || []) if (item?.track_id) dspById[item.track_id] = item;
     }
 
-    // B. Consultar endpoint en lote para Análisis DSP (/api/analyze/)
-    let dspResultsMap: Record<string, any> = {};
-    try {
-      const dspResp = await fetchWithTimeout(`${backendUrl}/api/analyze/`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tracks: payloadTracks }),
-      });
-      if (dspResp.ok) {
-        const dspData = await dspResp.json();
-        const dspArray = dspData?.results ?? [];
-        for (const item of dspArray) {
-          if (item?.track_id && item.success) {
-            dspResultsMap[item.track_id] = item;
-          }
-        }
-      }
-    } catch (e) {
-      console.warn('[SyncService] Advertencia en batch /api/analyze/:', e);
-    }
-
-    // 4. Iterar sobre las pistas y guardar en SQLite de forma no bloqueante (Yielding cada 4 actualizaciones)
-    for (let i = 0; i < pendingTracks.length; i++) {
-      const track = pendingTracks[i];
-      const lyricsInfo = lyricsResultsMap[track.id];
-      const dspInfo = dspResultsMap[track.id];
-
-      const updatePayload: {
-        bpm?: number | null;
-        camelot_key?: string | null;
-        lyrics_json?: string | null;
-        lyrics_lrc?: string | null;
-      } = {};
-
-      let hasNewData = false;
-
-      if (lyricsInfo) {
-        if (lyricsInfo.lyrics_lrc !== undefined) {
-          updatePayload.lyrics_lrc = lyricsInfo.lyrics_lrc;
-          hasNewData = true;
-        }
-        if (lyricsInfo.lyrics_json !== undefined) {
-          updatePayload.lyrics_json = typeof lyricsInfo.lyrics_json === 'string'
-            ? lyricsInfo.lyrics_json
-            : JSON.stringify(lyricsInfo.lyrics_json);
-          hasNewData = true;
-        }
-      }
-
-      if (dspInfo) {
-        if (dspInfo.bpm !== undefined && dspInfo.bpm !== null) {
-          updatePayload.bpm = Number(dspInfo.bpm);
-          hasNewData = true;
-        }
-        if (dspInfo.camelot_key !== undefined && dspInfo.camelot_key !== null) {
-          updatePayload.camelot_key = String(dspInfo.camelot_key);
-          hasNewData = true;
-        }
-      }
-
-      // Una respuesta vacia no debe marcar la pista como analizada ni fabricar BPM/tonalidad.
-      if (!hasNewData) {
+    for (let index = 0; index < pendingTracks.length; index++) {
+      const track = pendingTracks[index];
+      const lyricsResult = lyricsById[track.id];
+      const dspResult = dspById[track.id];
+      const keepStoredLyrics = hasStoredLyrics(track);
+      const update = {
+        ...(!keepStoredLyrics ? mapLyricsResult(lyricsResult) : {}),
+        ...mapDspResult(dspResult),
+        ...(!keepStoredLyrics && lyricsResult && !lyricsResult.success ? { lyrics_source: 'not_found' } : {}),
+        ...(!dspResult?.success && dspResult?.reason === 'AUDIO_REQUIRED'
+          ? { analysis_status: 'audio_required' }
+          : {}),
+      };
+      if (Object.keys(update).length === 0) {
         result.failedCount++;
-        continue;
-      }
-
-      const success = await updateTrackAnalysis(track.id, updatePayload);
-
-      if (success) {
+      } else if (await updateTrackAnalysis(track.id, update)) {
         result.syncedCount++;
       } else {
         result.failedCount++;
       }
-
-      // Yield temporal al event loop del JS / React para evitar saltos de frames en listas de 120 FPS
-      if ((i + 1) % 4 === 0) {
-        await new Promise(resolve => setTimeout(resolve, 10));
-      }
+      if ((index + 1) % 4 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 8));
     }
-
     result.success = true;
-    console.log(`[SyncService] Sincronización terminada: ${result.syncedCount} actualizadas, ${result.failedCount} fallidas.`);
     return result;
-
   } catch (error: any) {
-    console.error('[SyncService] Error crítico durante startBackgroundSync:', error);
     result.errors?.push(error?.message ?? String(error));
     return result;
   }
 };
 
-/**
- * Sincroniza inmediatamente una única pista seleccionada por el usuario en NowPlayingModal o LyricsModal.
- */
-export const syncSingleTrack = async (track: Track, backendUrl: string = CONFIGURED_BACKEND_URL): Promise<boolean> => {
-  if (!track || !track.id || !backendUrl) return false;
-  try {
-    const networkCheck = await checkCanSync(true); // Permite celular en petición única explícita del usuario
-    if (!networkCheck.canSync) return false;
+/** Synchronizes one active track and uploads it only when DSP is not cached. */
+export const syncSingleTrack = async (
+  track: Track,
+  backendUrl: string = CONFIGURED_BACKEND_URL
+): Promise<boolean> => {
+  if (!track?.id || !backendUrl) return false;
+  const networkCheck = await checkCanSync(true);
+  if (!networkCheck.canSync) return false;
 
+  try {
+    const cleanUrl = backendUrl.replace(/\/$/, '');
     const payload = [{
       track_id: track.id,
       id: track.id,
@@ -251,45 +312,98 @@ export const syncSingleTrack = async (track: Track, backendUrl: string = CONFIGU
       album: track.album ?? '',
       duration: track.duration ?? 0,
     }];
-
-    const cleanUrl = backendUrl.replace(/\/$/, '');
-    const [lyricsResp, dspResp] = await Promise.all([
-      fetchWithTimeout(`${cleanUrl}/api/lyrics/`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tracks: payload }),
-      }).catch(() => null),
+    const keepStoredLyrics = hasStoredLyrics(track);
+    const [lyricsResponse, dspResponse] = await Promise.all([
+      !keepStoredLyrics
+        ? fetchWithTimeout(`${cleanUrl}/api/lyrics/`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tracks: payload }),
+          }, 12000).catch(() => null)
+        : Promise.resolve(null),
       fetchWithTimeout(`${cleanUrl}/api/analyze/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tracks: payload }),
-      }).catch(() => null),
+      }, 12000).catch(() => null),
     ]);
 
-    let updateData: any = {};
-    if (lyricsResp && lyricsResp.ok) {
-      const data = await lyricsResp.json();
-      const item = (data?.results ?? [])[0] ?? data;
-      if (item?.success && item.lyrics_lrc) updateData.lyrics_lrc = item.lyrics_lrc;
-      if (
-        item?.success &&
-        item.lyrics_json &&
-        (typeof item.lyrics_json === 'string' || (Array.isArray(item.lyrics_json) && item.lyrics_json.length > 0))
-      ) {
-        updateData.lyrics_json = typeof item.lyrics_json === 'string' ? item.lyrics_json : JSON.stringify(item.lyrics_json);
-      }
+    let update: AnalysisUpdate = {};
+    if (lyricsResponse?.ok) {
+      const data = await lyricsResponse.json();
+      update = { ...update, ...mapLyricsResult((data?.results || [])[0] ?? data) };
     }
-    if (dspResp && dspResp.ok) {
-      const data = await dspResp.json();
-      const item = (data?.results ?? [])[0] ?? data;
-      if (item?.success && item.bpm !== undefined) updateData.bpm = Number(item.bpm);
-      if (item?.success && item.camelot_key !== undefined) updateData.camelot_key = String(item.camelot_key);
+    if (dspResponse?.ok) {
+      const data = await dspResponse.json();
+      update = { ...update, ...mapDspResult((data?.results || [])[0] ?? data) };
     }
-
-    if (Object.keys(updateData).length === 0) return false;
-    return await updateTrackAnalysis(track.id, updateData);
+    if (!update.analysis_status) {
+      const upload = await uploadTrackForAnalysis(track, cleanUrl);
+      if (upload.success) update = { ...update, ...mapDspResult(upload.data) };
+    }
+    return Object.keys(update).length > 0 && updateTrackAnalysis(track.id, update);
   } catch (error) {
-    console.error(`[SyncService] Error en syncSingleTrack para ${track.id}:`, error);
+    console.error(`[SyncService] Error sincronizando ${track.id}:`, error);
     return false;
   }
+};
+
+/** Explicit full-library DSP pass. Files are streamed sequentially over Wi-Fi. */
+export const analyzeLibraryAudio = async (
+  tracks: Track[],
+  options: AnalyzeLibraryOptions = {}
+): Promise<SyncResult> => {
+  const backendUrl = (options.backendUrl ?? CONFIGURED_BACKEND_URL).replace(/\/$/, '');
+  const result: SyncResult = { success: false, syncedCount: 0, failedCount: 0, errors: [] };
+  if (!backendUrl) return { ...result, reason: 'BACKEND_NO_CONFIGURADO' };
+
+  const networkCheck = await checkCanSync(options.forceOnCellular ?? false);
+  if (!networkCheck.canSync) return { ...result, reason: networkCheck.reason };
+
+  const pending = tracks.filter((track) =>
+    track.analysis_status !== 'ready' ||
+    !track.bpm ||
+    !track.camelot_key ||
+    !track.outro_duration_ms
+  );
+  if (pending.length === 0) return { ...result, success: true, reason: 'BIBLIOTECA_AL_DIA' };
+
+  for (let index = 0; index < pending.length; index++) {
+    if (options.shouldCancel?.()) return { ...result, reason: 'CANCELADO' };
+    const track = pending[index];
+    const baseProgress = {
+      current: index + 1,
+      total: pending.length,
+      trackId: track.id,
+      title: track.title,
+    };
+    options.onProgress?.({ ...baseProgress, phase: 'preparing', uploadProgress: 0 });
+    try {
+      const upload = await uploadTrackForAnalysis(track, backendUrl, (uploadProgress) => {
+        options.onProgress?.({ ...baseProgress, phase: 'uploading', uploadProgress });
+      });
+      if (!upload.success) {
+        result.failedCount++;
+        result.errors?.push(`${track.title}: ${upload.reason || 'ERROR_DSP'}`);
+        options.onProgress?.({ ...baseProgress, phase: 'failed', uploadProgress: 1 });
+      } else {
+        options.onProgress?.({ ...baseProgress, phase: 'analyzing', uploadProgress: 1 });
+        const saved = await updateTrackAnalysis(track.id, mapDspResult(upload.data));
+        if (saved) {
+          result.syncedCount++;
+          options.onProgress?.({ ...baseProgress, phase: 'saved', uploadProgress: 1 });
+        } else {
+          result.failedCount++;
+          options.onProgress?.({ ...baseProgress, phase: 'failed', uploadProgress: 1 });
+        }
+      }
+    } catch (error: any) {
+      result.failedCount++;
+      result.errors?.push(`${track.title}: ${error?.message || String(error)}`);
+      options.onProgress?.({ ...baseProgress, phase: 'failed', uploadProgress: 1 });
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 16));
+  }
+  result.success = result.syncedCount > 0 || result.failedCount === 0;
+  return result;
 };

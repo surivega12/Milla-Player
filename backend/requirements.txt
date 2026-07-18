@@ -14,6 +14,5 @@ scipy>=1.11.0
 librosa>=0.10.1
 soundfile>=0.12.1
 
-# Spleeter for Vocal Separation & Silence Detection
-# Nota: Si spleeter requiere TensorFlow en ciertas plataformas, librosa y scipy proveen fallback de detección de silencio espectral.
-spleeter>=2.4.0
+# Transition analysis is implemented directly with librosa/scipy. Keeping
+# Spleeter here would install an unused TensorFlow stack with conflicting NumPy pins.

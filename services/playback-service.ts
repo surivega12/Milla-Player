@@ -1,12 +1,13 @@
-import TrackPlayer, { Event } from 'react-native-track-player';
+import TrackPlayer, { Event, RepeatMode } from 'react-native-track-player';
 import { Platform } from 'react-native';
 import { globalVertexQueueManager, VertexTrack } from './queue-service';
-import { getCachedTracks, updateTrackPlayCount } from './database-service';
+import { getCachedTrackById, saveQueueSnapshot, updateTrackPlayCount } from './database-service';
 import { isUnresolvedSafUri, sanitizeTrackUriForPlayback } from './library-service';
 
 let fadingOutTrackId: string | null = null;
 let shouldFadeInNextTrack = false;
 let fadeRestoreVolume = 1;
+let fadeGeneration = 0;
 
 function toNativeTrackPayload(track: VertexTrack) {
   const url = sanitizeTrackUriForPlayback(track.url || track.id);
@@ -25,6 +26,15 @@ function toNativeTrackPayload(track: VertexTrack) {
     key: track.camelot_key || track.key,
     replayGainTrack: track.replayGainTrack,
     replayGainAlbum: track.replayGainAlbum,
+    vocal_silence_start_ms: track.vocal_silence_start_ms,
+    vocal_silence_end_ms: track.vocal_silence_end_ms,
+    intro_duration_ms: track.intro_duration_ms,
+    outro_duration_ms: track.outro_duration_ms,
+    outro_start_ms: track.outro_start_ms,
+    intro_energy: track.intro_energy,
+    outro_energy: track.outro_energy,
+    beat_interval_ms: track.beat_interval_ms,
+    analysis_status: track.analysis_status,
   };
 }
 
@@ -46,7 +56,6 @@ const applyReplayGain = async (track: any) => {
   
   try {
     await TrackPlayer.setVolume(targetVolume);
-    console.log(`[PlaybackService] ReplayGain aplicado: ${gain}dB -> Volumen: ${targetVolume.toFixed(2)}`);
   } catch (err) {
     console.warn('[PlaybackService] No se pudo ajustar el volumen ReplayGain:', err);
   }
@@ -120,6 +129,42 @@ async function prepareNextAutoMixTrack(): Promise<void> {
   await TrackPlayer.add([toNativeTrackPayload(nextTrack)], activeIndex + 1);
 }
 
+async function refillSequentialQueue(): Promise<void> {
+  if (globalVertexQueueManager.isAutoMixActive()) return;
+  const queue = await TrackPlayer.getQueue();
+  const activeIndex = await TrackPlayer.getActiveTrackIndex();
+  if (activeIndex === undefined || activeIndex === null || activeIndex < 0) return;
+  if (queue.length - activeIndex > 10) return;
+  const lastTrack = queue[queue.length - 1];
+  if (!lastTrack?.id) return;
+  const existingIds = new Set(queue.map((track) => String(track.id)));
+  const additions = globalVertexQueueManager.getSequentialTracksAfter(String(lastTrack.id), 30, existingIds);
+  if (additions.length > 0) await TrackPlayer.add(additions.map(toNativeTrackPayload));
+}
+
+async function persistNativeQueue(): Promise<void> {
+  const [queue, activeTrack] = await Promise.all([
+    TrackPlayer.getQueue(),
+    TrackPlayer.getActiveTrack().catch(() => undefined),
+  ]);
+  await saveQueueSnapshot(
+    queue.map((track) => String(track.id)),
+    activeTrack?.id ? String(activeTrack.id) : undefined
+  );
+}
+
+async function trimNativeQueueHistory(maxPreviousTracks = 2): Promise<void> {
+  const repeatMode = await TrackPlayer.getRepeatMode().catch(() => undefined);
+  if (repeatMode === RepeatMode.Queue) return;
+  const activeIndex = await TrackPlayer.getActiveTrackIndex();
+  if (activeIndex === undefined || activeIndex === null || activeIndex <= maxPreviousTracks) return;
+  const staleIndexes = Array.from(
+    { length: activeIndex - maxPreviousTracks },
+    (_, index) => index
+  );
+  if (staleIndexes.length > 0) await TrackPlayer.remove(staleIndexes);
+}
+
 /**
  * Servicio de reproducción nativo registrado en TrackPlayer (Arquitectura Maestro-Esclavo).
  * TrackPlayer actúa como esclavo, ejecutando las órdenes y alimentando las pistas que
@@ -169,27 +214,48 @@ export async function playbackService() {
   });
 
   TrackPlayer.addEventListener(Event.PlaybackProgressUpdated, async (event) => {
-    if (!globalVertexQueueManager.isAutoMixActive() || !event.duration) return;
+    const autoMixActive = globalVertexQueueManager.isAutoMixActive();
+    const crossOutEnabled = globalVertexQueueManager.isCrossOutEnabled();
+    if (!autoMixActive || !crossOutEnabled) {
+      if (fadingOutTrackId || shouldFadeInNextTrack) {
+        fadeGeneration += 1;
+        await TrackPlayer.setVolume(fadeRestoreVolume).catch(() => {});
+        fadingOutTrackId = null;
+        shouldFadeInNextTrack = false;
+      }
+      if (!autoMixActive) refillSequentialQueue().catch(() => {});
+      return;
+    }
+    if (!event.duration) return;
     const remaining = event.duration - event.position;
     const transitionSeconds = globalVertexQueueManager.getTransitionSeconds();
     if (fadingOutTrackId && remaining > transitionSeconds + 0.5) {
+      fadeGeneration += 1;
       await TrackPlayer.setVolume(fadeRestoreVolume).catch(() => {});
       fadingOutTrackId = null;
       shouldFadeInNextTrack = false;
     }
-    if (remaining <= 0 || remaining > transitionSeconds) return;
-
     const activeTrack = await TrackPlayer.getActiveTrack().catch(() => undefined);
+    const analyzedOutroSeconds = Number((activeTrack as any)?.outro_duration_ms || 0) / 1000;
+    const fadeWindowSeconds = globalVertexQueueManager.isCrossOutEnabled() && analyzedOutroSeconds > 0
+      ? Math.min(transitionSeconds, Math.max(1, analyzedOutroSeconds))
+      : transitionSeconds;
+    if (remaining <= 0 || remaining > fadeWindowSeconds) return;
+
     const activeId = activeTrack?.id ? String(activeTrack.id) : null;
     if (!activeId || fadingOutTrackId === activeId) return;
 
     fadingOutTrackId = activeId;
     shouldFadeInNextTrack = true;
+    const currentFadeGeneration = ++fadeGeneration;
     const startVolume = await TrackPlayer.getVolume().catch(() => 1);
     fadeRestoreVolume = startVolume;
-    for (let step = 3; step >= 0; step--) {
-      await TrackPlayer.setVolume(Math.max(0.02, startVolume * (step / 4))).catch(() => {});
-      await new Promise<void>((resolve) => setTimeout(resolve, 90));
+    const fadeDurationMs = Math.max(350, Math.min(remaining, fadeWindowSeconds) * 1000);
+    const steps = Math.max(8, Math.min(40, Math.round(fadeDurationMs / 100)));
+    for (let step = steps - 1; step >= 0; step--) {
+      if (fadeGeneration !== currentFadeGeneration || fadingOutTrackId !== activeId) return;
+      await TrackPlayer.setVolume(Math.max(0.02, startVolume * (step / steps))).catch(() => {});
+      await new Promise<void>((resolve) => setTimeout(resolve, fadeDurationMs / steps));
     }
   });
 
@@ -213,34 +279,49 @@ export async function playbackService() {
   // Interceptar cambio de pista activa en TrackPlayer y actualizar la notificación nativa desde SQLite
   TrackPlayer.addEventListener(Event.PlaybackActiveTrackChanged, async (event) => {
     if (event.track) {
+      const storedTrack = event.track.id
+        ? await getCachedTrackById(String(event.track.id)).catch(() => undefined)
+        : undefined;
+      const activeTrack = storedTrack
+        ? { ...event.track, ...storedTrack, url: event.track.url || storedTrack.url }
+        : event.track;
+
+      await trimNativeQueueHistory().catch(() => {});
+
       // 1. Aplicamos la normalización de volumen audiófila (ReplayGain LUFS) en tiempo real
-      await applyReplayGain(event.track);
+      const currentFadeGeneration = ++fadeGeneration;
+      await applyReplayGain(activeTrack);
       if (shouldFadeInNextTrack) {
         shouldFadeInNextTrack = false;
         fadingOutTrackId = null;
-        const targetVolume = await TrackPlayer.getVolume().catch(() => 1);
+        const targetVolume = await TrackPlayer.getVolume().catch(() => fadeRestoreVolume);
         await TrackPlayer.setVolume(0.02).catch(() => {});
-        for (let step = 1; step <= 5; step++) {
-          await TrackPlayer.setVolume(Math.max(0.02, targetVolume * (step / 5))).catch(() => {});
-          await new Promise<void>((resolve) => setTimeout(resolve, 80));
+        const fadeInSteps = 12;
+        for (let step = 1; step <= fadeInSteps; step++) {
+          if (fadeGeneration !== currentFadeGeneration) break;
+          await TrackPlayer.setVolume(Math.max(0.02, targetVolume * (step / fadeInSteps))).catch(() => {});
+          await new Promise<void>((resolve) => setTimeout(resolve, 75));
         }
       }
       
       // 2. Reportamos al Maestro (VertexQueueManager) cuál es la pista que realmente está sonando
-      globalVertexQueueManager.setCurrentTrack(event.track as any);
-      prepareNextAutoMixTrack().catch((error) => {
-        console.warn('[PlaybackService] No se pudo preparar la siguiente mezcla:', error);
-      });
-      if (event.track.id) {
-        updateTrackPlayCount(event.track.id).catch(() => {});
+      globalVertexQueueManager.setCurrentTrack(activeTrack as VertexTrack);
+      if (globalVertexQueueManager.isAutoMixActive()) {
+        prepareNextAutoMixTrack().catch((error) => {
+          console.warn('[PlaybackService] No se pudo preparar la siguiente mezcla:', error);
+        });
+      } else {
+        refillSequentialQueue().catch(() => {});
       }
-      console.log('[PlaybackService] Esclavo reporta nueva pista activa al Maestro:', event.track.title);
+      persistNativeQueue().catch(() => {});
+      if (event.track.id) {
+        updateTrackPlayCount(String(event.track.id)).catch(() => {});
+      }
 
       // 3. Actualizar de inmediato en la notificación y controles nativos de Android los metadatos reales de SQLite:
       // Título, Artista y el URI del thumbnail local de la carátula.
       try {
-        const cachedTracks = await getCachedTracks();
-        const dbTrack = cachedTracks.find(t => t.id === event.track?.id) || event.track;
+        const dbTrack = activeTrack;
         const thumbnailUri = (dbTrack as any).artwork_thumb || dbTrack.artwork || (event.track as any).artwork;
 
         await TrackPlayer.updateNowPlayingMetadata({
@@ -250,7 +331,6 @@ export async function playbackService() {
           artwork: thumbnailUri,
           duration: dbTrack.duration || (event.track as any).duration || 0,
         });
-        console.log('[PlaybackService] Notificación nativa de Android actualizada desde SQLite para:', dbTrack.title);
       } catch (metaErr) {
         console.warn('[PlaybackService] Error al actualizar metadatos nativos en Android:', metaErr);
       }

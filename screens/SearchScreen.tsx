@@ -291,9 +291,10 @@ export const SearchScreen: React.FC<SearchScreenProps> = ({
                     <Text className="text-sm font-semibold text-[var(--foreground)]">{item}</Text>
                   </View>
                   <TouchableOpacity
-                    onPress={() =>
-                      setRecentSearches(recentSearches.filter((_, idx) => idx !== index))
-                    }
+                    onPress={(event) => {
+                      event.stopPropagation();
+                      setRecentSearches(recentSearches.filter((_, idx) => idx !== index));
+                    }}
                   >
                     <X size={14} color={colors.mutedForeground} />
                   </TouchableOpacity>

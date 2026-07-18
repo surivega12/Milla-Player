@@ -39,8 +39,8 @@
       [
         "expo-media-library",
         {
-          "photosPermission": "Permite a Milla acceder a tu biblioteca de música y carátulas para el procesamiento Hi-Res y AutoMix offline.",
-          "savePhotosPermission": "Permite a Milla guardar carátulas procesadas y optimizadas en tu almacenamiento local.",
+          "photosPermission": "Permite a Milla acceder a tu biblioteca de musica y caratulas para el procesamiento Hi-Res y AutoMix offline.",
+          "savePhotosPermission": "Permite a Milla guardar caratulas procesadas y optimizadas en tu almacenamiento local.",
           "granularPermissions": ["audio"]
         }
       ]

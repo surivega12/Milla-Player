@@ -5,7 +5,6 @@ import {
   Pause,
   SkipBack,
   SkipForward,
-  Heart,
   Mic,
   ListPlus,
   Clock,
@@ -13,6 +12,8 @@ import {
   Cast,
   Disc,
 } from 'lucide-react-native';
+import { LiquidHeartButton } from './LiquidHeartButton';
+import { useTheme } from '../context/ThemeContext';
 import TrackPlayer, {
   useProgress,
   usePlaybackState,
@@ -39,10 +40,23 @@ export interface Track {
   needs_sync?: boolean;
   lyrics_json?: string;
   lyrics_lrc?: string;
+  lyrics_ttml?: string;
+  lyrics_plain?: string;
+  lyrics_source?: 'embedded_ttml' | 'embedded_lrc' | 'embedded_plain' | 'companion_lrc' | 'api' | string;
   lyrics?: string;
   genre?: string;
   play_count?: number;
   last_played?: number;
+  vocal_silence_start_ms?: number;
+  vocal_silence_end_ms?: number;
+  intro_duration_ms?: number;
+  outro_duration_ms?: number;
+  outro_start_ms?: number;
+  intro_energy?: number;
+  outro_energy?: number;
+  beat_interval_ms?: number;
+  analysis_version?: string;
+  analysis_status?: 'pending' | 'processing' | 'ready' | 'failed' | string;
 }
 
 export interface MiniPlayerProps {
@@ -87,6 +101,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
   onOpenQueue,
   onCast,
 }) => {
+  const { colors } = useTheme();
   // Conexión en vivo con react-native-track-player
   const progressData = useProgress();
   const activeTrackData = useActiveTrack();
@@ -164,7 +179,10 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
   };
 
   return (
-    <View className="mx-3 mb-2 rounded-2xl bg-[#151617] border border-neutral-800/90 shadow-2xl overflow-hidden p-3.5">
+    <View
+      className="mx-3 mb-2 rounded-2xl border shadow-2xl overflow-hidden p-3.5"
+      style={{ backgroundColor: colors.card, borderColor: colors.border }}
+    >
       {/* FILA SUPERIOR: Información (Izquierda) y Acciones Rápidas (Derecha) */}
       <View className="flex-row items-center justify-between mb-3">
         {/* Izquierda: Carátula, Título, Álbum y Artista */}
@@ -173,7 +191,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
           onPress={onPressBar}
           className="flex-row items-center flex-1 mr-3"
         >
-          <View className="w-12 h-12 rounded-lg bg-neutral-800 overflow-hidden mr-3 border border-neutral-700/50 items-center justify-center">
+          <View className="w-12 h-12 rounded-lg overflow-hidden mr-3 border items-center justify-center" style={{ backgroundColor: colors.muted, borderColor: colors.border }}>
             {displayArtwork && !artworkFailed ? (
               <Image
                 source={{ uri: displayArtwork }}
@@ -182,13 +200,14 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
                 onError={() => setArtworkFailed(true)}
               />
             ) : (
-              <Disc size={24} color="#6B7280" />
+              <Disc size={24} color={colors.mutedForeground} />
             )}
           </View>
 
           <View className="flex-1 justify-center">
             <Text
               className="text-sm font-bold text-white tracking-tight leading-tight mb-0.5"
+              style={{ color: colors.foreground }}
               numberOfLines={1}
             >
               {displayTrack.title}
@@ -196,6 +215,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
             {displayTrack.album ? (
               <Text
                 className="text-xs text-gray-400 font-medium leading-tight truncate"
+                style={{ color: colors.mutedForeground }}
                 numberOfLines={1}
               >
                 {displayTrack.album}
@@ -203,6 +223,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
             ) : null}
             <Text
               className="text-xs text-gray-400 font-medium leading-tight truncate"
+              style={{ color: colors.mutedForeground }}
               numberOfLines={1}
             >
               {displayTrack.artist}
@@ -213,17 +234,12 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
         {/* Derecha: Fila exacta de 5 Iconos de Utilidad en color gris claro/blanco sutil */}
         <View className="flex-row items-center gap-3">
           {/* 1. Corazón (Favorita) */}
-          <TouchableOpacity
+          <LiquidHeartButton
+            liked={isLiked}
             onPress={onToggleLike}
-            hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
-            className="p-1"
-          >
-            <Heart
-              size={18}
-              color={isLiked ? '#ef4444' : '#9CA3AF'}
-              fill={isLiked ? '#ef4444' : 'transparent'}
-            />
-          </TouchableOpacity>
+            size={18}
+            inactiveColor={colors.mutedForeground}
+          />
 
           {/* 2. Micrófono (Letras) */}
           <TouchableOpacity
@@ -231,7 +247,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
             hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
             className="p-1"
           >
-            <Mic size={18} color="#9CA3AF" />
+            <Mic size={18} color={colors.mutedForeground} />
           </TouchableOpacity>
 
           {/* 3. Añadir a lista de reproducción */}
@@ -240,7 +256,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
             hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
             className="p-1"
           >
-            <ListPlus size={18} color="#9CA3AF" />
+            <ListPlus size={18} color={colors.mutedForeground} />
           </TouchableOpacity>
 
           {/* 4. Reloj (Temporizador / Sleep Timer) */}
@@ -249,7 +265,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
             hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
             className="p-1"
           >
-            <Clock size={18} color="#9CA3AF" />
+            <Clock size={18} color={colors.mutedForeground} />
           </TouchableOpacity>
 
           {/* 5. Lista de Reproducción / Cola */}
@@ -258,27 +274,27 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
             hitSlop={{ top: 8, bottom: 8, left: 6, right: 6 }}
             className="p-1"
           >
-            <ListMusic size={18} color="#9CA3AF" />
+            <ListMusic size={18} color={colors.mutedForeground} />
           </TouchableOpacity>
         </View>
       </View>
 
       {/* FILA MEDIA: Barra de Progreso Integrada */}
       <View className="flex-row items-center justify-between my-1.5">
-        <Text className="text-[11px] font-medium text-gray-400 w-8 text-left">
+        <Text className="text-[11px] font-medium w-8 text-left" style={{ color: colors.mutedForeground }}>
           {formatTime(currentSecs)}
         </Text>
 
-        <View className="flex-1 mx-2 h-1.5 bg-neutral-800 rounded-full relative justify-center">
+        <View className="flex-1 mx-2 h-1.5 rounded-full relative justify-center" style={{ backgroundColor: colors.muted }}>
           {/* Progreso transcurrido */}
           <View
-            className="h-full bg-neutral-600 rounded-full"
-            style={{ width: `${activeProgress * 100}%` }}
+            className="h-full rounded-full"
+            style={{ width: `${activeProgress * 100}%`, backgroundColor: colors.mutedForeground }}
           />
           {/* Indicador de arrastre (Thumb) redondo naranja quemado / óxido (#B43C12) */}
           <View
             style={{
-              backgroundColor: '#B43C12',
+              backgroundColor: colors.primary,
               left: `${Math.min(Math.max(activeProgress * 100, 0), 95)}%`,
               marginLeft: -6,
             }}
@@ -286,7 +302,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
           />
         </View>
 
-        <Text className="text-[11px] font-medium text-gray-400 w-8 text-right">
+        <Text className="text-[11px] font-medium w-8 text-right" style={{ color: colors.mutedForeground }}>
           {formatTime(totalSecs)}
         </Text>
       </View>
@@ -306,7 +322,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
             hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
             className="p-1"
           >
-            <SkipBack size={24} color="#E5E7EB" />
+            <SkipBack size={24} color={colors.foreground} />
           </TouchableOpacity>
 
           <TouchableOpacity
@@ -315,13 +331,13 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
               handlePlayPause();
             }}
             activeOpacity={0.8}
-            style={{ backgroundColor: '#B43C12' }}
+            style={{ backgroundColor: colors.primary }}
             className="w-11 h-11 rounded-full items-center justify-center shadow-lg"
           >
             {activeIsPlaying ? (
-              <Pause size={20} color="#FFFFFF" fill="#FFFFFF" />
+              <Pause size={20} color={colors.primaryForeground} fill={colors.primaryForeground} />
             ) : (
-              <Play size={20} color="#FFFFFF" fill="#FFFFFF" style={{ marginLeft: 2 }} />
+              <Play size={20} color={colors.primaryForeground} fill={colors.primaryForeground} style={{ marginLeft: 2 }} />
             )}
           </TouchableOpacity>
 
@@ -333,7 +349,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
             hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}
             className="p-1"
           >
-            <SkipForward size={24} color="#E5E7EB" />
+            <SkipForward size={24} color={colors.foreground} />
           </TouchableOpacity>
         </View>
 
@@ -346,9 +362,10 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
                 onCast?.();
               }}
               hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-              className="p-1.5 rounded-lg bg-white/10 border border-white/20 items-center justify-center shadow-lg"
+              className="p-1.5 rounded-lg border items-center justify-center shadow-lg"
+              style={{ backgroundColor: colors.secondary, borderColor: colors.border }}
             >
-              <Cast size={18} color="#FFFFFF" />
+              <Cast size={18} color={colors.foreground} />
             </TouchableOpacity>
           )}
         </View>

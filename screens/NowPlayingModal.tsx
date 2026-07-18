@@ -6,18 +6,16 @@ import {
   TouchableOpacity,
   StyleSheet,
   Dimensions,
-  FlatList,
   Alert,
   PanResponder,
 } from 'react-native';
 import { BlurView } from 'expo-blur';
-import Animated, { useAnimatedStyle, withTiming, useSharedValue } from 'react-native-reanimated';
+import Animated, { runOnJS, useAnimatedStyle, withSpring, withTiming, useSharedValue } from 'react-native-reanimated';
 import {
   ChevronDown,
   Sparkles,
   MicVocal,
   AudioLines,
-  Heart,
   Download,
   Cast,
   List,
@@ -39,11 +37,11 @@ import {
 import Slider from '@react-native-community/slider';
 import TrackPlayer, { RepeatMode, useProgress } from 'react-native-track-player';
 import { getThemeColors } from '../utils/theme-colors';
-import { parseLrc, getDemoLyrics, LyricLine } from '../utils/lyrics';
 import { Track } from '../components/PlayerBar';
 import { LyricsModal } from './LyricsModal';
 import { QueueScreen } from './QueueScreen';
 import { TrackOptionsModal } from '../components/TrackOptionsModal';
+import { LiquidHeartButton } from '../components/LiquidHeartButton';
 
 
 const { width } = Dimensions.get('window');
@@ -65,44 +63,10 @@ interface NowPlayingModalProps {
   isSmartDJActive?: boolean;
   lyricsRequestNonce?: number;
   queueRequestNonce?: number;
+  sleepTimerRequestNonce?: number;
+  onOpenArtist?: () => void;
+  onOpenAlbum?: () => void;
 }
-
-const LyricLineRow = ({
-  line,
-  isActive,
-  onPress,
-  colors,
-}: {
-  line: LyricLine;
-  isActive: boolean;
-  onPress: () => void;
-  colors: any;
-}) => {
-  const animatedStyle = useAnimatedStyle(() => {
-    return {
-      opacity: withTiming(isActive ? 1.0 : 0.35, { duration: 250 }),
-      transform: [
-        { scale: withTiming(isActive ? 1.06 : 0.95, { duration: 250 }) },
-      ],
-    };
-  });
-
-  return (
-    <TouchableOpacity onPress={onPress} activeOpacity={0.7} className="py-3 px-4 justify-center items-center">
-      <Animated.Text
-        style={[
-          animatedStyle,
-          { color: isActive ? colors.primary : colors.foreground },
-        ]}
-        className={`text-center tracking-wide font-black ${
-          isActive ? 'text-xl' : 'text-base font-semibold'
-        }`}
-      >
-        {line.text}
-      </Animated.Text>
-    </TouchableOpacity>
-  );
-};
 
 export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
   isOpen,
@@ -120,9 +84,11 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
   isSmartDJActive = false,
   lyricsRequestNonce = 0,
   queueRequestNonce = 0,
+  sleepTimerRequestNonce = 0,
+  onOpenArtist,
+  onOpenAlbum,
 }) => {
   const colors = getThemeColors(currentTheme);
-  const [showLyrics, setShowLyrics] = useState<boolean>(false);
   const [showLyricsModal, setShowLyricsModal] = useState<boolean>(false);
   const [showQueueModal, setShowQueueModal] = useState<boolean>(false);
   const [showOptionsModal, setShowOptionsModal] = useState<boolean>(false);
@@ -134,19 +100,57 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
   const [isShuffleActive, setIsShuffleActive] = useState<boolean>(false);
   const [repeatMode, setRepeatMode] = useState<RepeatMode>(RepeatMode.Off);
   const [seekDraft, setSeekDraft] = useState<number | null>(null);
-  const flatListRef = useRef<FlatList<LyricLine>>(null);
+  const lastSleepRequestRef = useRef(0);
+  const lastLyricsRequestRef = useRef(0);
+  const lastQueueRequestRef = useRef(0);
   const nativeProgress = useProgress(500);
+  const dismissY = useSharedValue(0);
+
+  const dismissStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: dismissY.value }],
+    opacity: Math.max(0.72, 1 - dismissY.value / (Dimensions.get('window').height * 1.4)),
+  }));
+
+  const dismissPanResponder = useMemo(() => PanResponder.create({
+    onMoveShouldSetPanResponder: (_, gesture) =>
+      gesture.dy > 10 && Math.abs(gesture.dy) > Math.abs(gesture.dx) * 1.2,
+    onPanResponderMove: (_, gesture) => {
+      dismissY.value = Math.max(0, gesture.dy);
+    },
+    onPanResponderRelease: (_, gesture) => {
+      if (gesture.dy > 125 || gesture.vy > 0.85) {
+        dismissY.value = withTiming(
+          Dimensions.get('window').height,
+          { duration: 220 },
+          (finished) => {
+            if (finished) runOnJS(onClose)();
+          }
+        );
+      } else {
+        dismissY.value = withSpring(0, { damping: 20, stiffness: 220 });
+      }
+    },
+    onPanResponderTerminate: () => {
+      dismissY.value = withSpring(0, { damping: 20, stiffness: 220 });
+    },
+  }), [dismissY, onClose]);
+
+  useEffect(() => {
+    if (isOpen) dismissY.value = 0;
+  }, [isOpen, dismissY]);
 
   // Lógica de Doble Capa (Double-Layer Reanimated Crossfade)
   const [prevArtwork, setPrevArtwork] = useState<string | null>(null);
   const displayArtwork = track?.artwork_thumb || track?.artwork || null;
   const [currentArtwork, setCurrentArtwork] = useState<string | null>(displayArtwork);
+  const [currentArtworkFailed, setCurrentArtworkFailed] = useState(false);
   const crossfadeProgress = useSharedValue(1);
 
   useEffect(() => {
     if (displayArtwork !== currentArtwork) {
       setPrevArtwork(currentArtwork);
       setCurrentArtwork(displayArtwork);
+      setCurrentArtworkFailed(false);
       crossfadeProgress.value = 0;
       // Transición ultra fluida de 800ms
       crossfadeProgress.value = withTiming(1, { duration: 800 });
@@ -178,34 +182,6 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
     ? nativeProgress.position
     : totalSeconds * progress;
   const displayedSeconds = seekDraft ?? currentSeconds;
-
-  const lyricLines = useMemo(() => {
-    if (!track) return [];
-    return parseLrc(getDemoLyrics(track.id, track));
-  }, [track]);
-
-  const activeLineIndex = useMemo(() => {
-    if (lyricLines.length === 0) return -1;
-    let activeIndex = -1;
-    for (let i = 0; i < lyricLines.length; i++) {
-      if (displayedSeconds >= lyricLines[i].time) {
-        activeIndex = i;
-      } else {
-        break;
-      }
-    }
-    return activeIndex;
-  }, [lyricLines, displayedSeconds]);
-
-  useEffect(() => {
-    if (showLyrics && activeLineIndex >= 0 && flatListRef.current) {
-      flatListRef.current.scrollToIndex({
-        index: activeLineIndex,
-        animated: true,
-        viewPosition: 0.35,
-      });
-    }
-  }, [activeLineIndex, showLyrics]);
 
   const formatTime = (secs: number) => {
     const mins = Math.floor(secs / 60);
@@ -266,22 +242,20 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
       const currentIdx = await TrackPlayer.getActiveTrackIndex();
       
       if (nextShuffle && queue.length > 1) {
+        if (isSmartDJActive) await onToggleSmartDJ?.();
         const futureTracks = queue.slice((currentIdx ?? 0) + 1);
         for (let i = futureTracks.length - 1; i > 0; i--) {
           const j = Math.floor(Math.random() * (i + 1));
           [futureTracks[i], futureTracks[j]] = [futureTracks[j], futureTracks[i]];
         }
-        for (let i = 0; i < futureTracks.length; i++) {
-          const oldIndex = queue.findIndex(t => t.id === futureTracks[i].id);
-          if (oldIndex > (currentIdx ?? 0) && oldIndex !== (currentIdx ?? 0) + 1 + i) {
-            try {
-              await TrackPlayer.move(oldIndex, (currentIdx ?? 0) + 1 + i);
-            } catch (e) {}
-          }
+        const firstFutureIndex = (currentIdx ?? 0) + 1;
+        const futureIndexes = queue
+          .map((_, index) => index)
+          .filter((index) => index >= firstFutureIndex);
+        if (futureIndexes.length > 0) {
+          await TrackPlayer.remove(futureIndexes);
+          await TrackPlayer.add(futureTracks, firstFutureIndex);
         }
-        Alert.alert('Shuffle (Aleatorio)', 'Mezcla aleatoria activada en la cola de reproducción.');
-      } else {
-        Alert.alert('Shuffle (Aleatorio)', 'Mezcla aleatoria desactivada. Reproducción en orden armónico/secuencial.');
       }
     } catch (err) {
       console.warn('Error en toggle shuffle:', err);
@@ -292,20 +266,15 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
   const handleToggleRepeat = async () => {
     try {
       let nextMode = RepeatMode.Off;
-      let modeText = 'Desactivado';
       if (repeatMode === RepeatMode.Off) {
         nextMode = RepeatMode.Queue;
-        modeText = 'Repetir Lista';
       } else if (repeatMode === RepeatMode.Queue) {
         nextMode = RepeatMode.Track;
-        modeText = 'Repetir Canción Actual';
       } else {
         nextMode = RepeatMode.Off;
-        modeText = 'Desactivado';
       }
       setRepeatMode(nextMode);
       await TrackPlayer.setRepeatMode(nextMode);
-      Alert.alert('Modo de Repetición', modeText);
     } catch (err) {
       console.warn('Error cambiando modo repeat:', err);
     }
@@ -338,11 +307,17 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
   }, [sleepTimerActive, sleepRemainingSeconds]);
 
   useEffect(() => {
-    if (isOpen && lyricsRequestNonce > 0) setShowLyricsModal(true);
+    if (isOpen && lyricsRequestNonce > lastLyricsRequestRef.current) {
+      lastLyricsRequestRef.current = lyricsRequestNonce;
+      setShowLyricsModal(true);
+    }
   }, [isOpen, lyricsRequestNonce]);
 
   useEffect(() => {
-    if (isOpen && queueRequestNonce > 0) setShowQueueModal(true);
+    if (isOpen && queueRequestNonce > lastQueueRequestRef.current) {
+      lastQueueRequestRef.current = queueRequestNonce;
+      setShowQueueModal(true);
+    }
   }, [isOpen, queueRequestNonce]);
 
   useEffect(() => {
@@ -367,12 +342,23 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
     }
   };
 
+  useEffect(() => {
+    if (isOpen && sleepTimerRequestNonce > lastSleepRequestRef.current) {
+      lastSleepRequestRef.current = sleepTimerRequestNonce;
+      handleSleepTimerPress();
+    }
+  }, [isOpen, sleepTimerRequestNonce]);
+
   if (!isOpen || !track) {
     return null;
   }
 
   return (
-    <View style={StyleSheet.absoluteFill} className="z-50 bg-black">
+    <Animated.View
+      style={[StyleSheet.absoluteFill, dismissStyle, { backgroundColor: colors.background }]}
+      className="z-50"
+      {...dismissPanResponder.panHandlers}
+    >
       <View className="flex-1 pt-12 pb-6 px-6 justify-between">
         
         {/* Cabecera de Texto: Superior Izquierda (Título y Artista) con insignias a la derecha */}
@@ -380,16 +366,27 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
           <View className="flex-1 mr-4">
             <Text
               className="text-2xl font-bold text-white tracking-tight"
+              style={{ color: colors.foreground }}
               numberOfLines={1}
             >
               {track.title || 'Canción Sin Título'}
             </Text>
-            <Text
-              className="text-base font-medium text-neutral-400 mt-0.5"
-              numberOfLines={1}
-            >
-              {track.artist || 'Artista Desconocido'}
-            </Text>
+            <TouchableOpacity onPress={onOpenArtist} disabled={!onOpenArtist}>
+              <Text
+                className="text-base font-medium mt-0.5"
+                style={{ color: colors.foreground }}
+                numberOfLines={1}
+              >
+                {track.artist || 'Artista Desconocido'}
+              </Text>
+            </TouchableOpacity>
+            {track.album ? (
+              <TouchableOpacity onPress={onOpenAlbum} disabled={!onOpenAlbum}>
+                <Text className="text-xs font-medium mt-0.5" style={{ color: colors.mutedForeground }} numberOfLines={1}>
+                  {track.album}
+                </Text>
+              </TouchableOpacity>
+            ) : null}
           </View>
 
           {/* Grupo de Acciones Superiores (MillaSmartDJ & Sleep Timer) */}
@@ -427,8 +424,8 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
         {/* Carátula Central Perfectly Centered */}
         <View className="flex-1 items-center justify-center my-4 overflow-hidden">
           <View
-            style={{ width: ARTWORK_SIZE, height: ARTWORK_SIZE }}
-            className="rounded-2xl overflow-hidden shadow-2xl border border-white/5 bg-neutral-900"
+            style={{ width: ARTWORK_SIZE, height: ARTWORK_SIZE, backgroundColor: colors.card, borderColor: colors.border }}
+            className="rounded-2xl overflow-hidden shadow-2xl border"
           >
             {prevArtwork && (
               <Animated.Image
@@ -437,15 +434,16 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
                 resizeMode="cover"
               />
             )}
-            {currentArtwork ? (
+            {currentArtwork && !currentArtworkFailed ? (
               <Animated.Image
                 source={{ uri: currentArtwork }}
                 style={[{ width: '100%', height: '100%' }, currentArtworkStyle]}
                 resizeMode="cover"
+                onError={() => setCurrentArtworkFailed(true)}
               />
             ) : (
-              <Animated.View style={[{ width: '100%', height: '100%', justifyContent: 'center', alignItems: 'center', backgroundColor: '#18181b' }, currentArtworkStyle]}>
-                <Text className="text-xl font-bold text-neutral-600">VERTEX</Text>
+              <Animated.View style={[{ width: '100%', height: '100%', justifyContent: 'center', alignItems: 'center', backgroundColor: colors.card }, currentArtworkStyle]}>
+                <Text className="text-xl font-bold" style={{ color: colors.mutedForeground }}>MILLA</Text>
               </Animated.View>
             )}
           </View>
@@ -463,15 +461,15 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
               onSlidingStart={() => setSeekDraft(currentSeconds)}
               onValueChange={setSeekDraft}
               onSlidingComplete={(val) => handleSeekToLyric(val)}
-              minimumTrackTintColor="#bae6fd"
-              maximumTrackTintColor="rgba(255,255,255,0.15)"
-              thumbTintColor="#bae6fd"
+              minimumTrackTintColor={colors.primary}
+              maximumTrackTintColor={colors.border}
+              thumbTintColor={colors.primary}
             />
             <View className="flex-row justify-between items-center px-1 -mt-1">
-              <Text className="text-xs font-semibold text-neutral-400">
+              <Text className="text-xs font-semibold" style={{ color: colors.mutedForeground }}>
                 {formatTime(Math.floor(displayedSeconds))}
               </Text>
-              <Text className="text-xs font-semibold text-neutral-400">
+              <Text className="text-xs font-semibold" style={{ color: colors.mutedForeground }}>
                 {formatTime(Math.floor(totalSeconds))}
               </Text>
             </View>
@@ -484,29 +482,30 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
             </TouchableOpacity>
 
             <TouchableOpacity onPress={onPrev} className="p-2">
-              <SkipBack size={28} color="#ffffff" />
+              <SkipBack size={28} color={colors.foreground} />
             </TouchableOpacity>
 
             {/* Play / Pause dentro de contenedor cuadrado redondeado azul claro */}
             <TouchableOpacity
               onPress={onPlayPause}
               activeOpacity={0.85}
-              className="w-16 h-14 rounded-2xl bg-[#bae6fd] justify-center items-center shadow-xl"
+              className="w-16 h-14 rounded-2xl justify-center items-center shadow-xl"
+              style={{ backgroundColor: colors.primary }}
             >
               {isPlaying ? (
-                <Pause size={28} color="#09090b" fill="#09090b" />
+                <Pause size={28} color={colors.primaryForeground} fill={colors.primaryForeground} />
               ) : (
                 <Play
                   size={28}
-                  color="#09090b"
-                  fill="#09090b"
+                  color={colors.primaryForeground}
+                  fill={colors.primaryForeground}
                   style={{ marginLeft: 3 }}
                 />
               )}
             </TouchableOpacity>
 
             <TouchableOpacity onPress={onNext} className="p-2">
-              <SkipForward size={28} color="#ffffff" />
+              <SkipForward size={28} color={colors.foreground} />
             </TouchableOpacity>
 
             <TouchableOpacity onPress={handleToggleRepeat} className="p-2 relative">
@@ -541,13 +540,7 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
               <TouchableOpacity onPress={() => setShowLyricsModal(true)} className="p-1">
                 <MicVocal size={22} color={showLyricsModal ? '#bae6fd' : '#a3a3a3'} />
               </TouchableOpacity>
-              <TouchableOpacity onPress={onToggleLike} className="p-1">
-                <Heart
-                  size={22}
-                  color={isLiked ? '#ef4444' : '#a3a3a3'}
-                  fill={isLiked ? '#ef4444' : 'transparent'}
-                />
-              </TouchableOpacity>
+              <LiquidHeartButton liked={isLiked} onPress={onToggleLike} size={22} />
               <TouchableOpacity onPress={() => setShowQueueModal(true)} className="p-1">
                 <ListMusic size={22} color={showQueueModal ? '#bae6fd' : '#a3a3a3'} />
               </TouchableOpacity>
@@ -579,6 +572,10 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
         <QueueScreen
           isOpen={showQueueModal}
           onClose={() => setShowQueueModal(false)}
+          onOpenLyrics={() => {
+            setShowQueueModal(false);
+            setShowLyricsModal(true);
+          }}
         />
 
         <TrackOptionsModal
@@ -591,7 +588,7 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
           }}
         />
       </View>
-    </View>
+    </Animated.View>
   );
 };
 
