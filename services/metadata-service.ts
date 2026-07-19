@@ -1,12 +1,20 @@
 import jsmediatags from 'jsmediatags';
 import * as FileSystem from 'expo-file-system/legacy';
-import { getAudioMetadata } from '@missingcore/audio-metadata';
+import * as AudioMetadataPackage from '@missingcore/audio-metadata';
+
+// @missingcore/audio-metadata is useful for FLAC/MP3/M4A artwork, but older
+// builds can expose a broken legacy FileSystem dependency on Android. Treat it
+// as an optional reader and keep the scan alive when its export is unavailable.
+const getAudioMetadata = (AudioMetadataPackage as any)?.getAudioMetadata as
+  | ((uri: string, fields: readonly string[]) => Promise<any>)
+  | undefined;
 
 export interface TrackMetadata {
   duration?: number;
   title?: string;
   artist?: string;
   album?: string;
+  genre?: string;
   artwork_thumb?: string;
   bpm?: number;
   key?: string;
@@ -63,6 +71,7 @@ async function readBytes(fileUri: string, position: number, length: number): Pro
 }
 
 async function readFlacEmbeddedLyrics(fileUri: string): Promise<Partial<TrackMetadata>> {
+  if (!fileUri.startsWith('file://')) return {};
   if (!fileUri.split('?')[0].toLowerCase().endsWith('.flac')) return {};
   try {
     const signature = decodeUtf8(await readBytes(fileUri, 0, 4));
@@ -191,6 +200,7 @@ async function extractMetadataByChunks(
   trackId?: string,
   includeArtwork = true
 ): Promise<TrackMetadata> {
+  if (!fileUri.startsWith('file://') || typeof getAudioMetadata !== 'function') return {};
   const cleanUri = fileUri.split('?')[0].toLowerCase();
   if (!cleanUri.endsWith('.flac') && !cleanUri.endsWith('.mp3') && !cleanUri.endsWith('.m4a') && !cleanUri.endsWith('.mp4')) {
     return {};
@@ -199,6 +209,8 @@ async function extractMetadataByChunks(
   const requestedFields = includeArtwork
     ? ['name', 'artist', 'album', 'artwork'] as const
     : ['name', 'artist', 'album'] as const;
+  const fileInfo = await FileSystem.getInfoAsync(fileUri).catch(() => null);
+  if (!fileInfo?.exists || fileInfo.isDirectory) return {};
   const response = await Promise.race([
     getAudioMetadata(fileUri, requestedFields),
     new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
@@ -227,12 +239,13 @@ async function readJsMediaTags(
   trackId?: string,
   includePicture = false
 ): Promise<TrackMetadata> {
+  if (!fileUri.startsWith('file://')) return {};
   const readPromise = new Promise<TrackMetadata>((resolve) => {
     try {
       const Reader = (jsmediatags as any)?.Reader;
       if (!Reader) return resolve({});
       const reader = new Reader(fileUri).setTagsToRead([
-        'title', 'artist', 'album', 'lyrics', 'TBPM', 'TKEY', 'TXXX', 'tmpo',
+        'title', 'artist', 'album', 'genre', 'lyrics', 'TBPM', 'TKEY', 'TXXX', 'tmpo',
         ...(includePicture ? ['picture'] : []),
       ]);
       reader.read({
@@ -243,6 +256,7 @@ async function readJsMediaTags(
             if (typeof tags.title === 'string') metadata.title = tags.title.trim();
             if (typeof tags.artist === 'string') metadata.artist = tags.artist.trim();
             if (typeof tags.album === 'string') metadata.album = tags.album.trim();
+            if (typeof tags.genre === 'string') metadata.genre = tags.genre.trim();
 
             const rawBpm = tags.TBPM?.data ?? tags.tmpo?.data ?? tags.tmpo;
             const parsedBpm = Number.parseFloat(String(rawBpm ?? ''));
@@ -292,6 +306,7 @@ export const extractMetadata = async (
   includeArtwork = true
 ): Promise<TrackMetadata> => {
   try {
+    if (!fileUri.startsWith('file://')) return {};
     const [chunkedMetadata, tagMetadata, flacLyrics] = await Promise.all([
       extractMetadataByChunks(fileUri, trackId, includeArtwork).catch(() => ({})),
       readJsMediaTags(fileUri, trackId, false),

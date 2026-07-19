@@ -1,6 +1,7 @@
 'use dom';
 
 import React, { useEffect, useRef } from 'react';
+import type { DOMProps } from 'expo/dom';
 import '@uimaxbai/am-lyrics/am-lyrics.js';
 
 type AmLyricsElement = HTMLElement & {
@@ -27,9 +28,10 @@ export interface LyricsWaveDomProps {
   isPlaying: boolean;
   highlightColor?: string;
   ttml?: string;
-  onUnavailable?: () => Promise<void>;
+  allowRemoteLookup?: boolean;
+  onUnavailable?: () => void | Promise<void>;
   onSeek: (seconds: number) => Promise<void>;
-  dom?: unknown;
+  dom?: DOMProps;
 }
 
 export default function LyricsWaveDom({
@@ -41,6 +43,7 @@ export default function LyricsWaveDom({
   isPlaying,
   highlightColor = '#f6f4ef',
   ttml,
+  allowRemoteLookup = false,
   onUnavailable,
   onSeek,
 }: LyricsWaveDomProps) {
@@ -55,14 +58,14 @@ export default function LyricsWaveDom({
     element.songDuration = durationMs;
     element.duration = durationMs;
     element.ttml = ttml || undefined;
-    element.query = ttml ? undefined : `${title} ${artist}`.trim();
+    element.query = ttml || !allowRemoteLookup ? undefined : `${title} ${artist}`.trim();
     element.highlightColor = highlightColor;
     element.autoscroll = true;
     element.interpolate = true;
-  }, [album, artist, durationMs, highlightColor, title, ttml]);
+  }, [album, allowRemoteLookup, artist, durationMs, highlightColor, title, ttml]);
 
   useEffect(() => {
-    if (ttml || !onUnavailable) return;
+    if (ttml || !allowRemoteLookup || !onUnavailable) return;
     let cancelled = false;
     let checks = 0;
     const timer = window.setInterval(() => {
@@ -77,14 +80,14 @@ export default function LyricsWaveDom({
       const empty = root?.querySelector('.no-lyrics, .lyrics-plus-empty, .empty-state, [data-empty="true"]');
       if ((empty && checks >= 4) || checks >= 30) {
         window.clearInterval(timer);
-        onUnavailable().catch(() => {});
+        Promise.resolve(onUnavailable()).catch(() => {});
       }
     }, 500);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [onUnavailable, ttml]);
+  }, [allowRemoteLookup, onUnavailable, ttml]);
 
   useEffect(() => {
     const element = lyricsRef.current;

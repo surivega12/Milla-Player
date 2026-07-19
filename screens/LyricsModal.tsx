@@ -41,7 +41,7 @@ import {
   X,
 } from 'lucide-react-native';
 import Slider from '@react-native-community/slider';
-import TrackPlayer, { useProgress } from 'react-native-track-player';
+import TrackPlayer, { useProgress } from '../services/player-engine';
 import { getColors } from 'react-native-image-colors';
 
 import { getThemeColors } from '../utils/theme-colors';
@@ -49,8 +49,9 @@ import { parseLrc, lrcToWaveTtml, LyricLine } from '../utils/lyrics';
 import { Track } from '../components/PlayerBar';
 import LyricsWaveDom from '../components/LyricsWaveDom';
 import { extractMetadata } from '../services/metadata-service';
-import { sanitizeTrackUriForPlayback } from '../services/library-service';
+import { ensureTrackPlayableUri, findCompanionLyricsForTrack } from '../services/library-service';
 import { getCachedTrackById, updateTrackAnalysis } from '../services/database-service';
+import { checkCanSync, syncLyricsForTrack } from '../services/sync-service';
 import { LiquidHeartButton } from '../components/LiquidHeartButton';
 
 const { height } = Dimensions.get('window');
@@ -168,8 +169,9 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
   const [seekDraft, setSeekDraft] = useState<number | null>(null);
   const [resolvedLyrics, setResolvedLyrics] = useState<Partial<Track>>({});
   const [waveUnavailable, setWaveUnavailable] = useState(false);
+  const [allowRemoteLookup, setAllowRemoteLookup] = useState(false);
 
-  // 1. Consumir hook de progreso de react-native-track-player (frecuencia 100ms para precisión milimétrica)
+  // 1. Consumir el progreso del motor nativo para sincronizar la letra.
   const { position: progressSec, duration: nativeDuration } = useProgress(500);
 
   // Calcular segundos actuales exactos (priorizando el hook del motor nativo TrackPlayer)
@@ -182,10 +184,16 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
   useEffect(() => {
     setResolvedLyrics({});
     setWaveUnavailable(false);
-    if (!isOpen || !track?.url) return;
-    if (track.lyrics_ttml || track.lyrics_lrc || track.lyrics_plain || track.lyrics) return;
+    setWaveMode(true);
+    setAllowRemoteLookup(false);
+    if (!isOpen || !track?.id) return;
     let cancelled = false;
-    const hydrateEmbeddedLyrics = async () => {
+    const applyLyrics = (update: Partial<Track>) => {
+      if (!cancelled && (update.lyrics_ttml || update.lyrics_lrc || update.lyrics_plain || update.lyrics_json)) {
+        setResolvedLyrics((current) => ({ ...current, ...update }));
+      }
+    };
+    const resolveLyrics = async () => {
       const cachedTrack = await getCachedTrackById(track.id).catch(() => null);
       const cachedLyrics: Partial<Track> = {
         lyrics_ttml: cachedTrack?.lyrics_ttml,
@@ -194,32 +202,47 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
         lyrics_json: cachedTrack?.lyrics_json,
         lyrics_source: cachedTrack?.lyrics_source,
       };
-      if (
-        cachedLyrics.lyrics_ttml || cachedLyrics.lyrics_lrc ||
-        cachedLyrics.lyrics_plain || cachedLyrics.lyrics_json
-      ) {
-        if (!cancelled) setResolvedLyrics(cachedLyrics);
-        return;
+      applyLyrics(cachedLyrics);
+
+      let localLyrics: Partial<Track> = {};
+      let lyricsTrack: Track = track;
+      try {
+        const playbackUri = await ensureTrackPlayableUri(track);
+        lyricsTrack = { ...track, url: playbackUri };
+        const metadata = await extractMetadata(playbackUri, track.id, false);
+        const companionLyrics = metadata.lyrics_ttml || metadata.lyrics_lrc || metadata.lyrics_plain
+          ? null
+          : await findCompanionLyricsForTrack(track);
+        localLyrics = {
+          lyrics_ttml: metadata.lyrics_ttml,
+          lyrics_lrc: metadata.lyrics_lrc || companionLyrics || undefined,
+          lyrics_plain: metadata.lyrics_plain,
+          lyrics_source: metadata.lyrics_source || (companionLyrics ? 'companion_lrc' : undefined),
+        };
+        if (localLyrics.lyrics_ttml || localLyrics.lyrics_lrc || localLyrics.lyrics_plain) {
+          applyLyrics(localLyrics);
+          await updateTrackAnalysis(track.id, localLyrics).catch(() => false);
+        }
+      } catch (error) {
+        console.warn('[LyricsModal] No se pudieron leer las letras locales:', error);
       }
-      const metadata = await extractMetadata(
-        sanitizeTrackUriForPlayback(track.url || track.id),
-        track.id,
-        false
+
+      const hasTimedLyrics = Boolean(
+        cachedLyrics.lyrics_ttml || cachedLyrics.lyrics_lrc || cachedLyrics.lyrics_json ||
+        localLyrics.lyrics_ttml || localLyrics.lyrics_lrc || localLyrics.lyrics_json
       );
-      const lyricsUpdate: Partial<Track> = {
-        lyrics_ttml: metadata.lyrics_ttml,
-        lyrics_lrc: metadata.lyrics_lrc,
-        lyrics_plain: metadata.lyrics_plain,
-        lyrics_source: metadata.lyrics_source,
-      };
-      if (!cancelled && (lyricsUpdate.lyrics_ttml || lyricsUpdate.lyrics_lrc || lyricsUpdate.lyrics_plain)) {
-        setResolvedLyrics(lyricsUpdate);
-        await updateTrackAnalysis(track.id, lyricsUpdate).catch(() => false);
-      }
+      const network = await checkCanSync(false);
+      if (!cancelled) setAllowRemoteLookup(network.canSync);
+      if (!network.canSync || hasTimedLyrics || cachedLyrics.lyrics_source === 'not_found') return;
+
+      const remoteLyrics = await syncLyricsForTrack(lyricsTrack);
+      applyLyrics(remoteLyrics as Partial<Track>);
     };
-    hydrateEmbeddedLyrics().catch(() => {});
+    resolveLyrics().catch((error) => {
+      console.warn('[LyricsModal] No se pudo resolver la letra:', error);
+    });
     return () => { cancelled = true; };
-  }, [isOpen, track?.id, track?.url]);
+  }, [isOpen, track?.id, track?.url, track?.source_uri]);
 
   const effectiveLyricsTtml = resolvedLyrics.lyrics_ttml || track?.lyrics_ttml;
   const effectiveLyricsLrc = resolvedLyrics.lyrics_lrc || track?.lyrics_lrc || track?.lyrics;
@@ -346,8 +369,8 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
 
   const handleWaveUnavailable = useCallback(async () => {
     setWaveUnavailable(true);
-    if (lyricLines.length > 0) setWaveMode(false);
-  }, [lyricLines.length]);
+    setWaveMode(false);
+  }, []);
 
   const cycleTimingOffset = () => {
     setTimingOffsetMs((current) => current === 0 ? 250 : current === 250 ? -250 : 0);
@@ -403,12 +426,16 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
               <Text className="text-[10px] font-bold text-neutral-400 uppercase">
                 {waveTtml
                   ? (effectiveLyricsSource?.startsWith('embedded') ? 'Archivo' : 'LRC local')
-                  : waveUnavailable ? 'Letra local' : 'LyricsPlus'}
+                  : waveUnavailable ? 'Letra local' : allowRemoteLookup ? 'LyricsPlus' : 'Sin conexion'}
               </Text>
             </View>
 
             <View className="flex-row items-center gap-4">
-              <TouchableOpacity onPress={() => setWaveReloadNonce((value) => value + 1)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
+              <TouchableOpacity onPress={() => {
+                setWaveUnavailable(false);
+                setWaveMode(true);
+                setWaveReloadNonce((value) => value + 1);
+              }} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
                 <RefreshCw size={18} color="#a3a3a3" />
               </TouchableOpacity>
               <TouchableOpacity onPress={() => setWaveMode((value) => !value)} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
@@ -427,20 +454,24 @@ export const LyricsModal: React.FC<LyricsModalProps> = ({
 
           {/* Renderizado de Alto Rendimiento con FlashList */}
           <View className="flex-1 my-2">
-            {waveMode ? (
-              <LyricsWaveDom
-                key={`${track.id}-${waveReloadNonce}`}
-                title={track.title || ''}
-                artist={track.artist || ''}
-                album={track.album}
-                durationMs={(nativeDuration || track.duration || 0) * 1000}
-                currentTimeMs={currentSeconds * 1000}
-                isPlaying={isPlaying}
-                highlightColor="#f6f4ef"
-                ttml={waveTtml}
-                onUnavailable={handleWaveUnavailable}
-                onSeek={handleSeekToLyric}
-              />
+            {waveMode && (waveTtml || allowRemoteLookup) ? (
+              <View style={StyleSheet.absoluteFill}>
+                <LyricsWaveDom
+                  key={`${track.id}-${waveReloadNonce}`}
+                  title={track.title || ''}
+                  artist={track.artist || ''}
+                  album={track.album}
+                  durationMs={(nativeDuration || track.duration || 0) * 1000}
+                  currentTimeMs={currentSeconds * 1000}
+                  isPlaying={isPlaying}
+                  highlightColor="#f6f4ef"
+                  ttml={waveTtml}
+                  allowRemoteLookup={allowRemoteLookup}
+                  onUnavailable={handleWaveUnavailable}
+                  onSeek={handleSeekToLyric}
+                  dom={{ scrollEnabled: false, contentInsetAdjustmentBehavior: 'never' }}
+                />
+              </View>
             ) : lyricLines.length === 0 ? (
               <View className="flex-1 items-center justify-center px-8 text-center">
                 <MicVocal size={48} color="rgba(255,255,255,0.3)" style={{ marginBottom: 14 }} />

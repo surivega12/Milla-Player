@@ -1,17 +1,17 @@
-import TrackPlayer, { Event, RepeatMode } from 'react-native-track-player';
+import TrackPlayer, { Event, RepeatMode } from './player-engine';
 import { Platform } from 'react-native';
 import { globalVertexQueueManager, VertexTrack } from './queue-service';
 import { getCachedTrackById, saveQueueSnapshot, updateTrackPlayCount } from './database-service';
-import { isUnresolvedSafUri, sanitizeTrackUriForPlayback } from './library-service';
+import { ensureTrackPlayableUri, isTrackPlayerCompatibleUri } from './library-service';
 
 let fadingOutTrackId: string | null = null;
 let shouldFadeInNextTrack = false;
 let fadeRestoreVolume = 1;
 let fadeGeneration = 0;
 
-function toNativeTrackPayload(track: VertexTrack) {
-  const url = sanitizeTrackUriForPlayback(track.url || track.id);
-  if (!url || isUnresolvedSafUri(url)) {
+async function toNativeTrackPayload(track: VertexTrack) {
+  const url = await ensureTrackPlayableUri(track);
+  if (!url || !isTrackPlayerCompatibleUri(url)) {
     throw new Error(`La ruta de "${track.title}" no es reproducible.`);
   }
   return {
@@ -43,6 +43,10 @@ function toNativeTrackPayload(track: VertexTrack) {
 // 0 dB = 1.0 (máximo). Si el gain es negativo, bajamos el volumen.
 const applyReplayGain = async (track: any) => {
   if (!track || Platform.OS === 'web') return;
+  if (!globalVertexQueueManager.isVolumeNormalizationEnabled()) {
+    await TrackPlayer.setVolume(1).catch(() => {});
+    return;
+  }
   
   // Asumimos que los metadatos tienen 'replayGainTrack'
   const gain = track.replayGainTrack || track.replayGainAlbum || 0;
@@ -86,7 +90,7 @@ async function injectAndPlayTrackFromMaster(nextTrack: VertexTrack): Promise<voi
     }
 
     // Preparamos el payload compatible con TrackPlayer asegurando thumbnail local (artwork_thumb)
-    const trackPayload = toNativeTrackPayload(nextTrack);
+    const trackPayload = await toNativeTrackPayload(nextTrack);
 
     if (currentActiveIndex !== undefined && currentActiveIndex >= 0) {
       // Inyectar en índice actual + 1 para mantener la consistencia del reproductor
@@ -126,7 +130,7 @@ async function prepareNextAutoMixTrack(): Promise<void> {
     .map((_, index) => index)
     .filter((index) => index > activeIndex);
   if (upcomingIndexes.length > 0) await TrackPlayer.remove(upcomingIndexes);
-  await TrackPlayer.add([toNativeTrackPayload(nextTrack)], activeIndex + 1);
+  await TrackPlayer.add([await toNativeTrackPayload(nextTrack)], activeIndex + 1);
 }
 
 async function refillSequentialQueue(): Promise<void> {
@@ -138,8 +142,12 @@ async function refillSequentialQueue(): Promise<void> {
   const lastTrack = queue[queue.length - 1];
   if (!lastTrack?.id) return;
   const existingIds = new Set(queue.map((track) => String(track.id)));
-  const additions = globalVertexQueueManager.getSequentialTracksAfter(String(lastTrack.id), 30, existingIds);
-  if (additions.length > 0) await TrackPlayer.add(additions.map(toNativeTrackPayload));
+  const additions = globalVertexQueueManager.getSequentialTracksAfter(String(lastTrack.id), 1, existingIds);
+  if (additions.length > 0) {
+    const payloads = [] as Awaited<ReturnType<typeof toNativeTrackPayload>>[];
+    for (const track of additions) payloads.push(await toNativeTrackPayload(track));
+    await TrackPlayer.add(payloads);
+  }
 }
 
 async function persistNativeQueue(): Promise<void> {
@@ -229,6 +237,15 @@ export async function playbackService() {
     if (!event.duration) return;
     const remaining = event.duration - event.position;
     const transitionSeconds = globalVertexQueueManager.getTransitionSeconds();
+    if (transitionSeconds <= 0) {
+      if (fadingOutTrackId || shouldFadeInNextTrack) {
+        fadeGeneration += 1;
+        await TrackPlayer.setVolume(fadeRestoreVolume).catch(() => {});
+        fadingOutTrackId = null;
+        shouldFadeInNextTrack = false;
+      }
+      return;
+    }
     if (fadingOutTrackId && remaining > transitionSeconds + 0.5) {
       fadeGeneration += 1;
       await TrackPlayer.setVolume(fadeRestoreVolume).catch(() => {});
@@ -237,10 +254,16 @@ export async function playbackService() {
     }
     const activeTrack = await TrackPlayer.getActiveTrack().catch(() => undefined);
     const analyzedOutroSeconds = Number((activeTrack as any)?.outro_duration_ms || 0) / 1000;
+    const analyzedOutroStartSeconds = Number((activeTrack as any)?.outro_start_ms || 0) / 1000;
     const fadeWindowSeconds = globalVertexQueueManager.isCrossOutEnabled() && analyzedOutroSeconds > 0
       ? Math.min(transitionSeconds, Math.max(1, analyzedOutroSeconds))
       : transitionSeconds;
-    if (remaining <= 0 || remaining > fadeWindowSeconds) return;
+    const naturalFadeStart = Math.max(0, event.duration - fadeWindowSeconds);
+    const isUsefulEarlyOutro = analyzedOutroStartSeconds > 4 &&
+      analyzedOutroStartSeconds < naturalFadeStart &&
+      event.duration - analyzedOutroStartSeconds <= 45;
+    const fadeStart = isUsefulEarlyOutro ? analyzedOutroStartSeconds : naturalFadeStart;
+    if (remaining <= 0 || event.position < fadeStart) return;
 
     const activeId = activeTrack?.id ? String(activeTrack.id) : null;
     if (!activeId || fadingOutTrackId === activeId) return;
@@ -256,6 +279,26 @@ export async function playbackService() {
       if (fadeGeneration !== currentFadeGeneration || fadingOutTrackId !== activeId) return;
       await TrackPlayer.setVolume(Math.max(0.02, startVolume * (step / steps))).catch(() => {});
       await new Promise<void>((resolve) => setTimeout(resolve, fadeDurationMs / steps));
+    }
+
+    // This TrackPlayer setup owns one active decoder. For a DSP-confirmed long
+    // outro, advance after the fade instead of leaving a silent tail.
+    if (isUsefulEarlyOutro && fadeGeneration === currentFadeGeneration && fadingOutTrackId === activeId) {
+      try {
+        const [queue, activeIndex] = await Promise.all([
+          TrackPlayer.getQueue(),
+          TrackPlayer.getActiveTrackIndex(),
+        ]);
+        if (activeIndex !== undefined && activeIndex !== null && queue[activeIndex + 1]) {
+          await TrackPlayer.skipToNext();
+          await TrackPlayer.play();
+        }
+      } catch (error) {
+        shouldFadeInNextTrack = false;
+        fadingOutTrackId = null;
+        await TrackPlayer.setVolume(fadeRestoreVolume).catch(() => {});
+        console.warn('[PlaybackService] No se pudo avanzar tras el cross-out:', error);
+      }
     }
   });
 

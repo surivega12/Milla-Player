@@ -10,6 +10,7 @@ import {
   Alert,
   Switch,
   Linking,
+  TextInput,
 } from 'react-native';
 import Slider from '@react-native-community/slider';
 import * as Notifications from 'expo-notifications';
@@ -26,6 +27,7 @@ import {
 } from '../services/database-service';
 import { refreshLocalTrackMetadata } from '../services/library-service';
 import { globalVertexQueueManager } from '../services/queue-service';
+import { getBackendUrl, saveBackendUrl } from '../services/sync-service';
 import Animated, {
   useSharedValue,
   useAnimatedScrollHandler,
@@ -59,8 +61,6 @@ export interface SettingsScreenProps {
   onSelectTheme: (theme: string) => void;
   bufferMode: 'aggressive' | 'balanced' | 'eco';
   onSelectBufferMode: (mode: 'aggressive' | 'balanced' | 'eco') => void;
-  audioQuality: 'hires' | 'hq' | 'standard';
-  onSelectAudioQuality: (quality: 'hires' | 'hq' | 'standard') => void;
   onClearCache: () => void;
   cacheSize: string;
   onAutoMixEnabledChange?: (enabled: boolean) => void;
@@ -95,8 +95,6 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   onSelectTheme,
   bufferMode,
   onSelectBufferMode,
-  audioQuality,
-  onSelectAudioQuality,
   onClearCache,
   cacheSize,
   onAutoMixEnabledChange,
@@ -112,6 +110,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     harmonic_mode: 'free',
     crossfade_seconds: 6,
     cross_out_enabled: true,
+    volume_normalization: false,
     equalizer_preset: 'flat',
   });
 
@@ -120,6 +119,8 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   const [backupStatusMsg, setBackupStatusMsg] = useState<string>('');
   const [advancedTask, setAdvancedTask] = useState<'metadata' | 'database' | null>(null);
   const [advancedProgress, setAdvancedProgress] = useState<string>('');
+  const [backendUrlDraft, setBackendUrlDraft] = useState('');
+  const [backendUrlStatus, setBackendUrlStatus] = useState('');
 
   useEffect(() => {
     let isMounted = true;
@@ -136,6 +137,9 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         if (isMounted && settings) {
           setAutoMixSettings(settings);
         }
+      });
+      getBackendUrl().then((url) => {
+        if (isMounted) setBackendUrlDraft(url);
       });
     } else if (activeModal === 'backup') {
       listLocalBackups().then(list => {
@@ -194,6 +198,17 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     } finally {
       setAdvancedTask(null);
       setAdvancedProgress('');
+    }
+  };
+
+  const handleSaveBackendUrl = async () => {
+    setBackendUrlStatus('');
+    try {
+      const normalized = await saveBackendUrl(backendUrlDraft);
+      setBackendUrlDraft(normalized);
+      setBackendUrlStatus(normalized ? 'Servidor local guardado' : 'Servidor local desactivado');
+    } catch (error: any) {
+      setBackendUrlStatus(error?.message || 'No se pudo guardar el servidor local');
     }
   };
 
@@ -527,9 +542,9 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               <View style={[styles.optionCard, { flexDirection: 'column', alignItems: 'flex-start' }]}>
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between', width: '100%' }}>
                   <View style={{ flex: 1 }}>
-                    <Text style={styles.optionTitle}>Duración del Crossfade</Text>
+                    <Text style={styles.optionTitle}>Ventana de transicion Auto Mix</Text>
                     <Text style={styles.optionDesc}>
-                      Tiempo de desvanecimiento entre la pista actual y la siguiente
+                      Duracion maxima del fade de salida antes de la siguiente pista compatible
                     </Text>
                   </View>
                   <Text style={{ color: '#B43C12', fontSize: 16, fontWeight: '800', marginLeft: 12 }}>
@@ -543,6 +558,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                     maximumValue={12}
                     step={1}
                     value={autoMixSettings.crossfade_seconds}
+                    disabled={!autoMixSettings.enabled}
                     onValueChange={(val) => setAutoMixSettings((current) => ({ ...current, crossfade_seconds: val }))}
                     onSlidingComplete={(val) => updateAndSaveAutoMixSetting({ crossfade_seconds: val })}
                     minimumTrackTintColor="#B43C12"
@@ -561,13 +577,68 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                 </View>
                 <Switch
                   value={autoMixSettings.cross_out_enabled}
+                  disabled={!autoMixSettings.enabled}
                   onValueChange={(val) => updateAndSaveAutoMixSetting({ cross_out_enabled: val })}
                   trackColor={{ false: '#262626', true: '#B43C12' }}
                   thumbColor="#FFFFFF"
                 />
               </View>
 
+              <View style={styles.optionCard}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.optionTitle}>Normalizar volumen (ReplayGain)</Text>
+                  <Text style={styles.optionDesc}>
+                    Desactivado por defecto para respetar el volumen y la dinamica original del archivo
+                  </Text>
+                </View>
+                <Switch
+                  value={Boolean(autoMixSettings.volume_normalization)}
+                  onValueChange={(val) => updateAndSaveAutoMixSetting({ volume_normalization: val })}
+                  trackColor={{ false: '#262626', true: '#B43C12' }}
+                  thumbColor="#FFFFFF"
+                />
+              </View>
+
               {/* SECCIÓN 2: ECUALIZADOR DIGITAL Y HARDWARE */}
+              <View style={[styles.optionCard, { flexDirection: 'column', alignItems: 'stretch' }]}>
+                <Text style={styles.optionTitle}>Servidor local de letras y Auto Mix</Text>
+                <TextInput
+                  value={backendUrlDraft}
+                  onChangeText={setBackendUrlDraft}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  keyboardType="url"
+                  placeholder="http://192.168.1.50:8000"
+                  placeholderTextColor="#737373"
+                  style={{
+                    color: '#ffffff',
+                    borderWidth: 1,
+                    borderColor: '#3f3f46',
+                    borderRadius: 6,
+                    paddingHorizontal: 12,
+                    paddingVertical: 10,
+                    marginTop: 10,
+                    fontSize: 13,
+                  }}
+                />
+                <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 10 }}>
+                  <Text style={[styles.optionDesc, { flex: 1, marginRight: 10 }]} numberOfLines={2}>
+                    Solo Wi-Fi local o HTTPS. La biblioteca permanece en tu dispositivo.
+                  </Text>
+                  <TouchableOpacity
+                    onPress={handleSaveBackendUrl}
+                    style={{ backgroundColor: '#B43C12', borderRadius: 6, paddingHorizontal: 14, paddingVertical: 9 }}
+                  >
+                    <Text style={{ color: '#ffffff', fontSize: 12, fontWeight: '800' }}>Guardar</Text>
+                  </TouchableOpacity>
+                </View>
+                {backendUrlStatus ? (
+                  <Text style={{ color: backendUrlStatus.includes('guardado') ? '#86efac' : '#fca5a5', fontSize: 12, marginTop: 8 }}>
+                    {backendUrlStatus}
+                  </Text>
+                ) : null}
+              </View>
+
               <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 24, marginBottom: 10 }}>
                 <Text style={[styles.sectionHeader, { marginBottom: 0, marginTop: 0 }]}>Ecualizador de Sonido</Text>
                 <TouchableOpacity onPress={openSystemEqualizer} style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: '#262626', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 12 }}>
@@ -607,34 +678,22 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                 })}
               </View>
 
-              {/* SECCIÓN 3: CALIDAD Y BUFFER */}
-              <Text style={[styles.sectionHeader, { marginTop: 24 }]}>Calidad del Motor de Audio</Text>
-              {[
-                { id: 'hires', title: 'Audiophile Lossless', desc: 'FLAC 24-bit/192kHz • Bit-perfect' },
-                { id: 'hq', title: 'High Quality', desc: 'MP3 320kbps • Audio balanceado comprimido' },
-                { id: 'standard', title: 'Standard', desc: 'AAC 128kbps • Ahorro de datos móviles' },
-              ].map((q) => {
-                const selected = audioQuality === q.id;
-                return (
-                  <TouchableOpacity
-                    key={q.id}
-                    style={[styles.optionCard, selected && styles.optionCardSelected]}
-                    onPress={() => onSelectAudioQuality(q.id as any)}
-                  >
-                    <View style={{ flex: 1 }}>
-                      <Text style={[styles.optionTitle, selected && { color: '#818cf8' }]}>{q.title}</Text>
-                      <Text style={styles.optionDesc}>{q.desc}</Text>
-                    </View>
-                    {selected && <Check size={20} color="#818cf8" />}
-                  </TouchableOpacity>
-                );
-              })}
+              <Text style={[styles.sectionHeader, { marginTop: 24 }]}>Fidelidad de origen</Text>
+              <View style={styles.optionCard}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.optionTitle}>Archivo original sin conversion</Text>
+                  <Text style={styles.optionDesc}>
+                    Milla no cambia bitrate, sample rate ni volumen. MP3, FLAC, WAV y otros formatos se entregan al decodificador nativo tal como estan guardados.
+                  </Text>
+                </View>
+                <Check size={20} color="#86efac" />
+              </View>
 
-              <Text style={[styles.sectionHeader, { marginTop: 20 }]}>Decodificadores y Perfiles de Buffer</Text>
+              <Text style={[styles.sectionHeader, { marginTop: 20 }]}>Frecuencia de actualizacion de interfaz</Text>
               {[
-                { id: 'aggressive', title: 'Audiophile Aggressive', desc: '50s pre-buffer • 5GB cache • Anti-stutter' },
-                { id: 'balanced', title: 'Balanced Buffer', desc: '20s pre-buffer • 1GB cache • Estándar recomendado' },
-                { id: 'eco', title: 'Eco Mode', desc: '8s pre-buffer • 256MB cache • Ahorro máximo de batería' },
+                { id: 'aggressive', title: 'Fluida', desc: 'Controles y progreso se actualizan cada segundo' },
+                { id: 'balanced', title: 'Equilibrada', desc: 'Mantiene los controles responsivos con menos trabajo visual' },
+                { id: 'eco', title: 'Ahorro', desc: 'Reduce las actualizaciones visuales para ahorrar bateria' },
               ].map((b) => {
                 const selected = bufferMode === b.id;
                 return (

@@ -68,6 +68,7 @@ interface HomeScreenProps {
   isOptimizing?: boolean;
   optimizationProgressText?: string;
   onNavigateToArtists?: () => void;
+  onAutoMixSessionChange?: (enabled: boolean) => void;
 }
 
 type SubScreenType = 'home' | 'history' | 'recent' | 'top_played';
@@ -90,6 +91,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   isOptimizing = false,
   optimizationProgressText,
   onNavigateToArtists,
+  onAutoMixSessionChange,
 }) => {
   const colors = getThemeColors(currentTheme);
   const [activeSubScreen, setActiveSubScreen] = useState<SubScreenType>('home');
@@ -120,14 +122,22 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     if (typeof setSessionAutoMixForced === 'function') {
       setSessionAutoMixForced(true);
     }
+    onAutoMixSessionChange?.(true);
     if (typeof setCatalog === 'function') {
       setCatalog(playlistTracks as any);
     }
-    await playPlaylist(playlistTracks, 0);
-    Alert.alert(
-      titleAlert,
-      `🎵 Sesión iniciada con ${playlistTracks.length} canciones.\n⚡ Modo Auto Mix con Crossfade FORZADO y activo para esta sesión táctica.`
-    );
+    try {
+      await playPlaylist(playlistTracks, 0);
+      Alert.alert(
+        titleAlert,
+        `Sesion iniciada con ${playlistTracks.length} canciones. Auto Mix armonico esta activo para esta sesion.`
+      );
+    } catch (error: any) {
+      setSessionAutoMixForced(false);
+      onAutoMixSessionChange?.(false);
+      console.warn('[HomeScreen] No se pudo iniciar la sesion Auto Mix:', error);
+      Alert.alert('Milla DJ', error?.message || 'No se pudo preparar la primera pista de esta sesion.');
+    }
   };
 
   const scrollY = useSharedValue(0);

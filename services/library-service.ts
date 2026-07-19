@@ -3,7 +3,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import { Platform } from 'react-native';
 import { Track } from '../components/PlayerBar';
 import { extractMetadata } from './metadata-service';
-import { getCachedTracks, insertTracks, deleteTracks, updateTrackUri, setWebMockTracks } from './database-service';
+import { getCachedTracks, insertTracks, updateTrackPlaybackUri, updateTrackUri, setWebMockTracks } from './database-service';
 import jsmediatags from 'jsmediatags';
 
 export async function requestLibraryPermission(): Promise<boolean> {
@@ -17,7 +17,13 @@ export async function requestLibraryPermission(): Promise<boolean> {
   return false;
 }
 
-const AUDIO_EXTENSIONS_REGEX = /\.(mp3|flac|wav|m4a|aac|ogg|dsd|dff|dsf)$/i;
+const AUDIO_EXTENSIONS = ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'opus', 'dsd', 'dff', 'dsf'] as const;
+const AUDIO_EXTENSIONS_REGEX = new RegExp(`\\.(${AUDIO_EXTENSIONS.join('|')})$`, 'i');
+const PLAYBACK_CACHE_DIR_NAME = 'milla-playback/';
+const PLAYBACK_CACHE_MAX_FILES = 12;
+const PLAYBACK_CACHE_MAX_BYTES = 512 * 1024 * 1024;
+const materializationPromises = new Map<string, Promise<string>>();
+const playbackCacheLastUsed = new Map<string, number>();
 
 function getFileQualityBadge(filename: string): string {
   const ext = filename.split('.').pop()?.toLowerCase() || '';
@@ -25,7 +31,7 @@ function getFileQualityBadge(filename: string): string {
   if (ext === 'wav') return 'WAV Lossless';
   if (ext === 'dsf' || ext === 'dff' || ext === 'dsd') return 'DSD Direct';
   if (ext === 'm4a' || ext === 'aac') return 'AAC Audio';
-  if (ext === 'ogg') return 'OGG Vorbis';
+  if (ext === 'ogg' || ext === 'opus') return ext === 'opus' ? 'Opus Audio' : 'OGG Vorbis';
   if (ext === 'mp3') return 'MP3 Audio';
   return `${ext.toUpperCase() || 'AUDIO'} Universal`;
 }
@@ -110,8 +116,13 @@ export function resolveAndroidContentUriToFileUri(uri: string): string | null {
   return toFileUri(relativePath ? `${storageRoot}/${relativePath}` : storageRoot);
 }
 
-export function isUnresolvedSafUri(uri: string): boolean {
-  return decodeURIComponentSafe(uri).startsWith(SAF_EXTERNAL_STORAGE_PREFIX);
+export function isContentUri(uri: string): boolean {
+  return decodeURIComponentSafe(uri).startsWith('content://');
+}
+
+export function isTrackPlayerCompatibleUri(uri: string): boolean {
+  const normalized = sanitizeTrackUriForPlayback(uri);
+  return normalized.startsWith('file://') || /^https?:\/\//i.test(normalized);
 }
 
 /**
@@ -131,13 +142,196 @@ export function sanitizeTrackUriForPlayback(uri: string): string {
   return normalized.startsWith('/') ? toFileUri(normalized) : normalized;
 }
 
+function stableUriHash(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index++) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function inferAudioExtension(track: Pick<Track, 'file_extension' | 'qualityBadge' | 'url' | 'source_uri' | 'id'>): string {
+  const candidates = [track.file_extension, track.source_uri, track.url, track.id]
+    .filter((value): value is string => Boolean(value));
+  for (const candidate of candidates) {
+    const decoded = decodeURIComponentSafe(candidate).split('?')[0];
+    const extension = decoded.split('.').pop()?.toLowerCase() || '';
+    if ((AUDIO_EXTENSIONS as readonly string[]).includes(extension)) return `.${extension}`;
+  }
+  const badge = String(track.qualityBadge || '').toLowerCase();
+  if (badge.includes('flac')) return '.flac';
+  if (badge.includes('wav')) return '.wav';
+  if (badge.includes('dsd')) return '.dsf';
+  if (badge.includes('aac')) return '.aac';
+  if (badge.includes('ogg')) return '.ogg';
+  return '.audio';
+}
+
+function getTrackUriCandidates(track: Pick<Track, 'id' | 'url' | 'source_uri'>): string[] {
+  return [track.url, track.source_uri, track.id]
+    .filter((uri): uri is string => Boolean(uri && uri.trim()))
+    .filter((uri, index, values) => values.indexOf(uri) === index);
+}
+
+async function existingLocalFileUri(candidates: string[]): Promise<string | null> {
+  for (const candidate of candidates) {
+    const normalized = sanitizeTrackUriForPlayback(candidate);
+    if (!normalized.startsWith('file://')) continue;
+    const info = await FileSystem.getInfoAsync(normalized).catch(() => null);
+    if (info?.exists && !info.isDirectory) {
+      if (normalized.includes(`/${PLAYBACK_CACHE_DIR_NAME}`)) {
+        playbackCacheLastUsed.set(normalized, Date.now());
+      }
+      return normalized;
+    }
+  }
+  return null;
+}
+
+async function prunePlaybackCache(preserveUri: string): Promise<void> {
+  const cacheDirectory = FileSystem.cacheDirectory;
+  if (!cacheDirectory) return;
+  const cacheDir = `${cacheDirectory}${PLAYBACK_CACHE_DIR_NAME}`;
+  const files = await FileSystem.readDirectoryAsync(cacheDir).catch(() => [] as string[]);
+  const entries = await Promise.all(files.map(async (name) => {
+    const uri = `${cacheDir}${name}`;
+    const info = await FileSystem.getInfoAsync(uri).catch(() => null);
+    if (!info?.exists || info.isDirectory) return null;
+    return {
+      uri,
+      size: Number(info.size || 0),
+      usedAt: playbackCacheLastUsed.get(uri) || Number(info.modificationTime || 0) * 1000,
+    };
+  }));
+  const cacheEntries = entries.filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+  let totalBytes = cacheEntries.reduce((total, entry) => total + entry.size, 0);
+  let totalFiles = cacheEntries.length;
+  if (totalFiles <= PLAYBACK_CACHE_MAX_FILES && totalBytes <= PLAYBACK_CACHE_MAX_BYTES) return;
+
+  const protectedUris = new Set(
+    cacheEntries
+      .sort((a, b) => b.usedAt - a.usedAt)
+      .slice(0, 3)
+      .map((entry) => entry.uri)
+  );
+  protectedUris.add(preserveUri);
+
+  for (const entry of [...cacheEntries].sort((a, b) => a.usedAt - b.usedAt)) {
+    if (totalFiles <= PLAYBACK_CACHE_MAX_FILES && totalBytes <= PLAYBACK_CACHE_MAX_BYTES) break;
+    if (protectedUris.has(entry.uri)) continue;
+    await FileSystem.deleteAsync(entry.uri, { idempotent: true }).catch(() => {});
+    playbackCacheLastUsed.delete(entry.uri);
+    totalFiles -= 1;
+    totalBytes -= entry.size;
+  }
+}
+
+async function materializeContentUri(
+  sourceUri: string,
+  extension: string
+): Promise<string> {
+  const cacheDirectory = FileSystem.cacheDirectory;
+  if (!cacheDirectory) throw new Error('CACHE_DIRECTORY_UNAVAILABLE');
+  const cacheDir = `${cacheDirectory}${PLAYBACK_CACHE_DIR_NAME}`;
+  await FileSystem.makeDirectoryAsync(cacheDir, { intermediates: true }).catch(() => {});
+  const targetUri = `${cacheDir}${stableUriHash(sourceUri)}${extension}`;
+  const cached = await FileSystem.getInfoAsync(targetUri).catch(() => null);
+  if (cached?.exists && !cached.isDirectory && Number(cached.size || 0) > 0) {
+    playbackCacheLastUsed.set(targetUri, Date.now());
+    return targetUri;
+  }
+
+  await FileSystem.copyAsync({ from: sourceUri, to: targetUri });
+  const copied = await FileSystem.getInfoAsync(targetUri).catch(() => null);
+  if (!copied?.exists || copied.isDirectory || Number(copied.size || 0) <= 0) {
+    throw new Error('CONTENT_COPY_FAILED');
+  }
+  playbackCacheLastUsed.set(targetUri, Date.now());
+  void prunePlaybackCache(targetUri);
+  return targetUri;
+}
+
 /**
- * Helper para generar huella única anti-duplicados usando nombre de archivo + duración exacta en milisegundos.
+ * ExoPlayer and metadata readers receive only a real file:// URI for local
+ * Android content. Source content URIs remain in SQLite for cache recovery.
  */
-function getTrackFingerprint(filename: string, durationSec?: number): string {
-  const cleanName = decodeURIComponentSafe(filename).trim().toLowerCase().replace(/\.[^/.]+$/, '');
-  const durationMs = Math.round((durationSec || 0) * 1000);
-  return `${cleanName}_${durationMs}`;
+export async function ensureTrackPlayableUri(
+  track: Pick<Track, 'id' | 'url' | 'source_uri' | 'file_extension' | 'qualityBadge'>
+): Promise<string> {
+  const candidates = getTrackUriCandidates(track);
+  const localUri = await existingLocalFileUri(candidates);
+  if (localUri) return localUri;
+
+  const remoteUri = candidates.find((uri) => /^https?:\/\//i.test(uri));
+  if (remoteUri) return remoteUri;
+
+  const sourceUri = candidates.find((uri) => isContentUri(uri));
+  if (!sourceUri) {
+    throw new Error('RUTA_LOCAL_NO_ACCESIBLE');
+  }
+
+  const key = sourceUri;
+  const existing = materializationPromises.get(key);
+  if (existing) return existing;
+
+  const promise = materializeContentUri(sourceUri, inferAudioExtension(track))
+    .then(async (fileUri) => {
+      await updateTrackPlaybackUri(track.id, fileUri, sourceUri).catch(() => false);
+      return fileUri;
+    })
+    .catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`No se pudo preparar el archivo local para reproducirlo (${message}).`);
+    })
+    .finally(() => {
+      materializationPromises.delete(key);
+    });
+  materializationPromises.set(key, promise);
+  return promise;
+}
+
+function getFilenameFromUri(uri: string): string {
+  const withoutQuery = decodeURIComponentSafe(uri).split('?')[0];
+  return withoutQuery.split('/').filter(Boolean).pop() || '';
+}
+
+function getSafParentDirectoryUri(fileUri: string): string | null {
+  const withoutQuery = String(fileUri || '').split('?')[0];
+  const marker = '/document/';
+  const markerIndex = withoutQuery.indexOf(marker);
+  if (markerIndex < 0 || !withoutQuery.startsWith(SAF_EXTERNAL_STORAGE_PREFIX)) return null;
+
+  const documentId = decodeURIComponentSafe(withoutQuery.slice(markerIndex + marker.length));
+  const separator = documentId.lastIndexOf('/');
+  if (separator <= 0) return null;
+  const parentDocumentId = documentId.slice(0, separator);
+  return `${withoutQuery.slice(0, markerIndex + marker.length)}${encodeURIComponent(parentDocumentId)}`;
+}
+
+async function readLyricsSidecar(uri: string): Promise<string | null> {
+  const info = await FileSystem.getInfoAsync(uri).catch(() => null);
+  if (!info?.exists || info.isDirectory) return null;
+  const content = await FileSystem.readAsStringAsync(info.uri || uri, { encoding: FileSystem.EncodingType.UTF8 });
+  return content?.trim() || null;
+}
+
+async function findSafLyricsSidecar(fileUri: string, baseName: string): Promise<string | null> {
+  if (Platform.OS !== 'android') return null;
+  const parentUri = getSafParentDirectoryUri(fileUri);
+  if (!parentUri) return null;
+  const items = await FileSystem.StorageAccessFramework.readDirectoryAsync(parentUri).catch(() => [] as string[]);
+  const normalizedBaseName = baseName.toLocaleLowerCase('es');
+  for (const itemUri of items) {
+    const itemName = getFilenameFromUri(itemUri);
+    const extension = itemName.split('.').pop()?.toLocaleLowerCase('es');
+    const itemBaseName = itemName.replace(/\.[^/.]+$/, '').toLocaleLowerCase('es');
+    if ((extension === 'lrc' || extension === 'txt') && itemBaseName === normalizedBaseName) {
+      const content = await readLyricsSidecar(itemUri).catch(() => null);
+      if (content) return content;
+    }
+  }
+  return null;
 }
 
 /**
@@ -157,11 +351,16 @@ async function findAndLinkLyricsNative(asset: any): Promise<string | null> {
     }
 
     if (fileUri && (fileUri.startsWith('file://') || fileUri.startsWith('content://'))) {
+      const filename = asset.filename || getFilenameFromUri(fileUri);
+      const baseName = decodeURIComponentSafe(filename).replace(/\.[^/.]+$/, '');
+      if (fileUri.startsWith('content://')) {
+        const content = await findSafLyricsSidecar(fileUri, baseName);
+        if (content) return content;
+        return null;
+      }
       const lastSlashIdx = fileUri.lastIndexOf('/');
       if (lastSlashIdx !== -1) {
         const dirPath = fileUri.substring(0, lastSlashIdx + 1);
-        const filename = asset.filename || fileUri.substring(lastSlashIdx + 1);
-        const baseName = decodeURIComponentSafe(filename).replace(/\.[^/.]+$/, '');
 
         // 1. Verificar archivo con extensión .lrc
         const lrcPathEncoded = `${dirPath}${encodeURIComponent(baseName)}.lrc`;
@@ -190,6 +389,75 @@ async function findAndLinkLyricsNative(asset: any): Promise<string | null> {
     console.warn('[LibraryService] Error buscando letras físicas en carpeta:', err);
   }
   return null;
+}
+
+export async function findCompanionLyricsForTrack(
+  track: Pick<Track, 'id' | 'url' | 'source_uri'>
+): Promise<string | null> {
+  const sourceUri = track.source_uri || track.url || track.id;
+  if (!sourceUri) return null;
+  return findAndLinkLyricsNative({
+    id: track.id,
+    uri: sourceUri,
+    sourceUri,
+    filename: decodeURIComponentSafe(sourceUri).split('?')[0].split('/').pop(),
+  });
+}
+
+/**
+ * Hydrates only the file the listener actually opens. Full metadata extraction
+ * is deliberately not performed while a 900+ item library is rendering.
+ */
+export async function hydrateTrackMetadataForPlayback(track: Track): Promise<Track> {
+  if (Platform.OS === 'web' || !track?.id || String(track.url || '').startsWith('http')) {
+    return track;
+  }
+
+  const playbackUri = await ensureTrackPlayableUri(track);
+  if (!playbackUri.startsWith('file://')) return { ...track, url: playbackUri };
+
+  const metadata = await extractMetadata(playbackUri, track.id, true);
+  const companionLyrics = metadata.lyrics_ttml || metadata.lyrics_lrc || metadata.lyrics_plain
+    ? null
+    : await findCompanionLyricsForTrack(track);
+  const title = metadata.title?.trim() || track.title;
+  const artist = metadata.artist?.trim() || track.artist;
+  const hydrated: Track = {
+    ...track,
+    url: playbackUri,
+    source_uri: track.source_uri || (isContentUri(String(track.url || '')) ? track.url : undefined),
+    title,
+    artist,
+    album: metadata.album?.trim() || track.album,
+    duration: Math.round(metadata.duration || track.duration || 0),
+    artwork: metadata.artwork_thumb || track.artwork,
+    artwork_thumb: metadata.artwork_thumb || track.artwork_thumb,
+    bpm: metadata.bpm ?? track.bpm,
+    key: metadata.key || track.key,
+    genre: metadata.genre || track.genre,
+    replayGainTrack: metadata.replayGainTrack ?? track.replayGainTrack,
+    replayGainAlbum: metadata.replayGainAlbum ?? track.replayGainAlbum,
+    lyrics_ttml: metadata.lyrics_ttml || track.lyrics_ttml,
+    lyrics_lrc: metadata.lyrics_lrc || companionLyrics || track.lyrics_lrc || track.lyrics,
+    lyrics_plain: metadata.lyrics_plain || track.lyrics_plain,
+    lyrics_source: metadata.lyrics_source || (companionLyrics ? 'companion_lrc' : track.lyrics_source),
+    needs_repair: metadata.title && metadata.artist ? false : track.needs_repair,
+  };
+
+  const changed = hydrated.url !== track.url ||
+    hydrated.title !== track.title ||
+    hydrated.artist !== track.artist ||
+    hydrated.album !== track.album ||
+    hydrated.artwork_thumb !== track.artwork_thumb ||
+    hydrated.lyrics_ttml !== track.lyrics_ttml ||
+    hydrated.lyrics_lrc !== track.lyrics_lrc ||
+    hydrated.lyrics_plain !== track.lyrics_plain ||
+    hydrated.genre !== track.genre ||
+    hydrated.bpm !== track.bpm ||
+    hydrated.key !== track.key;
+
+  if (changed) await insertTracks([hydrated]);
+  return hydrated;
 }
 
 /**
@@ -339,7 +607,7 @@ export async function readDirectoryRecursivelyNative(
           const rawFilename = decodedUri.split('/').pop()?.split('%2F').pop()?.split('?')[0] || 'unknown';
           const ext = rawFilename.split('.').pop()?.toLowerCase() || '';
 
-          const isAudioExt = ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'dsd', 'dff', 'dsf'].includes(ext);
+          const isAudioExt = (AUDIO_EXTENSIONS as readonly string[]).includes(ext);
           if (isAudioExt) {
             const info = await FileSystem.getInfoAsync(itemUri).catch(() => null);
             collectedAssets.push({
@@ -382,7 +650,7 @@ export async function readDirectoryRecursivelyNative(
           } else if (info && info.exists) {
             const rawFilename = decodeURIComponentSafe(item);
             const ext = rawFilename.split('.').pop()?.toLowerCase() || '';
-            const isAudioExt = ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'dsd', 'dff', 'dsf'].includes(ext);
+            const isAudioExt = (AUDIO_EXTENSIONS as readonly string[]).includes(ext);
             if (isAudioExt) {
               collectedAssets.push({
                 uri: sanitizeTrackUriForPlayback(itemPath),
@@ -457,48 +725,18 @@ export async function selectManualMusicFolder(): Promise<string | null> {
   return null;
 }
 
-async function resolvePlayableAssetUri(asset: any): Promise<string> {
-  const sourceUri = asset?.sourceUri || asset?.uri || asset?.localUri || '';
-  const directUri = sanitizeTrackUriForPlayback(sourceUri);
-  const needsMediaLibraryLookup = sourceUri.startsWith('content://') && Boolean(asset?.id) && !directUri.startsWith('file://');
-
-  if (directUri && !isUnresolvedSafUri(directUri) && !needsMediaLibraryLookup) {
-    return directUri;
-  }
-
-  // MediaLibrary puede entregar localUri para activos indexados por Android. Se prioriza sobre
-  // content:// para que TrackPlayer y jsmediatags reciban una ruta local cuando esté disponible.
-  if (asset?.id) {
-    try {
-      const info: any = await MediaLibrary.getAssetInfoAsync(asset.id);
-      const resolvedInfoUri = info?.localUri || info?.uri || '';
-      const playableUri = sanitizeTrackUriForPlayback(resolvedInfoUri);
-      if (playableUri && !isUnresolvedSafUri(playableUri)) {
-        return playableUri;
-      }
-    } catch (error) {
-      console.warn('[LibraryService] No se pudo resolver localUri de MediaLibrary:', error);
-    }
-  }
-
-  return directUri;
-}
-
 async function resolveScannedAssets(allAssets: any[]): Promise<any[]> {
-  const resolvedAssets: any[] = [];
-  const BATCH_SIZE = 20;
-
-  for (let index = 0; index < allAssets.length; index += BATCH_SIZE) {
-    const batch = await Promise.all(allAssets.slice(index, index + BATCH_SIZE).map(async (asset) => ({
+  // Resolving every MediaLibrary item with getAssetInfoAsync blocks navigation on
+  // large libraries. Keep the stable source URI now and materialize only a track
+  // that is actually played, opened for lyrics, or explicitly optimized.
+  return allAssets.map((asset) => {
+    const sourceUri = asset?.sourceUri || asset?.uri || asset?.id || '';
+    return {
       ...asset,
-      sourceUri: asset.sourceUri || asset.uri,
-      uri: await resolvePlayableAssetUri(asset),
-    })));
-    resolvedAssets.push(...batch);
-    await new Promise<void>((resolve) => setTimeout(resolve, 0));
-  }
-
-  return resolvedAssets;
+      sourceUri,
+      uri: sanitizeTrackUriForPlayback(asset?.localUri || sourceUri),
+    };
+  });
 }
 
 export async function scanDeviceAudioFiles(
@@ -521,14 +759,18 @@ export async function refreshLocalTrackMetadata(
     const track = localTracks[index];
     onProgress?.(index + 1, localTracks.length, track.title);
     try {
-      const uri = sanitizeTrackUriForPlayback(track.url || track.id);
-      if (!uri || isUnresolvedSafUri(uri)) throw new Error('URI_NOT_READABLE');
+      const uri = await ensureTrackPlayableUri(track);
+      if (!uri || !uri.startsWith('file://')) throw new Error('URI_NOT_READABLE');
       const metadata = await extractMetadata(uri, track.id);
+      const companionLyrics = metadata.lyrics_ttml || metadata.lyrics_lrc || metadata.lyrics_plain
+        ? null
+        : await findCompanionLyricsForTrack(track);
       const title = metadata.title || track.title;
       const artist = metadata.artist || track.artist;
       pendingBatch.push({
         ...track,
         url: uri,
+        source_uri: track.source_uri || track.url || track.id,
         title,
         artist,
         album: metadata.album || track.album,
@@ -537,12 +779,13 @@ export async function refreshLocalTrackMetadata(
         artwork_thumb: metadata.artwork_thumb || track.artwork_thumb,
         bpm: metadata.bpm ?? track.bpm,
         key: metadata.key || track.key,
+        genre: metadata.genre || track.genre,
         replayGainTrack: metadata.replayGainTrack ?? track.replayGainTrack,
         replayGainAlbum: metadata.replayGainAlbum ?? track.replayGainAlbum,
         lyrics_ttml: metadata.lyrics_ttml || track.lyrics_ttml,
-        lyrics_lrc: metadata.lyrics_lrc || track.lyrics_lrc,
+        lyrics_lrc: metadata.lyrics_lrc || companionLyrics || track.lyrics_lrc,
         lyrics_plain: metadata.lyrics_plain || track.lyrics_plain,
-        lyrics_source: metadata.lyrics_source || track.lyrics_source,
+        lyrics_source: metadata.lyrics_source || (companionLyrics ? 'companion_lrc' : track.lyrics_source),
         needs_repair: !title || !artist || /unknown|desconocido/i.test(artist),
       });
       updated++;
@@ -609,6 +852,9 @@ export async function scanLocalAudioFiles(
 
     const cachedTracks = await getCachedTracks();
     const cachedIds = new Set(cachedTracks.map(t => t.id));
+    const cachedUris = new Set(
+      cachedTracks.flatMap((track) => [track.url, track.source_uri]).filter((uri): uri is string => Boolean(uri))
+    );
 
     let allAssets: any[] = [];
     if (targetFolderUri) {
@@ -639,7 +885,7 @@ export async function scanLocalAudioFiles(
     const validAssets = resolvedAssets.filter(asset => {
       const rawName = asset.filename || asset.sourceUri || asset.uri || '';
       const cleanNameLower = decodeURIComponentSafe(rawName).toLowerCase();
-      const isAudioExt = AUDIO_EXTENSIONS_REGEX.test(cleanNameLower) || ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'dsd', 'dff', 'dsf'].some(ext => cleanNameLower.endsWith(`.${ext}`)) || asset.mediaType === 'audio';
+      const isAudioExt = AUDIO_EXTENSIONS_REGEX.test(cleanNameLower) || (AUDIO_EXTENSIONS as readonly string[]).some(ext => cleanNameLower.endsWith(`.${ext}`)) || asset.mediaType === 'audio';
       const hasValidDuration = !asset.duration || asset.duration >= 3;
       return isAudioExt && hasValidDuration;
     });
@@ -647,41 +893,27 @@ export async function scanLocalAudioFiles(
     if (onProgress) onProgress(`Sincronizando ${validAssets.length} audios compatibles...`, 0, validAssets.length);
 
     const newAssetsToInsert: any[] = [];
-    const activeAssetUris = new Set<string>();
-    const migratedIds = new Set<string>();
 
     for (const asset of validAssets) {
-      activeAssetUris.add(asset.uri);
-      if (cachedIds.has(asset.uri)) continue;
+      const sourceUri = asset.sourceUri || asset.uri || asset.id || '';
+      const canonicalId = String(asset.id || sourceUri || asset.uri);
+      if (cachedIds.has(canonicalId) || cachedUris.has(sourceUri) || cachedUris.has(asset.uri)) continue;
 
-      const sourceUri = asset.sourceUri || asset.uri;
       if (sourceUri !== asset.uri && cachedIds.has(sourceUri)) {
         const migrated = await updateTrackUri(sourceUri, asset.uri);
         if (migrated) {
           cachedIds.add(asset.uri);
-          migratedIds.add(sourceUri);
           continue;
         }
       }
 
-      newAssetsToInsert.push(asset);
+      newAssetsToInsert.push({ ...asset, sourceUri, canonicalId });
     }
 
-    if (!targetFolderUri && activeAssetUris.size > 0 && cachedTracks.length > 0) {
-      const deletedIds: string[] = [];
-      for (const track of cachedTracks) {
-        if (!activeAssetUris.has(track.id) && !migratedIds.has(track.id)) {
-          deletedIds.push(track.id);
-        }
-      }
-      if (deletedIds.length > 0) {
-        try {
-          await deleteTracks(deletedIds);
-        } catch (delErr) {
-          console.warn('[LibraryService] Error al limpiar pistas antiguas eliminadas:', delErr);
-        }
-      }
-    }
+    // MediaStore can return only a partial view of storage on Android (for
+    // example after a SAF grant or while the provider is indexing). A scan is
+    // additive by design; it must never erase a persisted local track merely
+    // because this particular provider did not return it today.
 
     if (newAssetsToInsert.length > 0) {
       const BATCH_SIZE = 50;
@@ -697,60 +929,35 @@ export async function scanLocalAudioFiles(
 
         for (const asset of batchAssets) {
           try {
-            let meta: any = {};
-            try {
-              meta = await extractMetadata(asset.uri, asset.uri, false);
-            } catch (metaErr) {
-              meta = {};
-            }
-            
-            const rawName = asset.filename || asset.uri || '';
+            const rawName = asset.filename || asset.sourceUri || asset.uri || '';
             const cleanName = decodeURIComponentSafe(rawName).split('/').pop()?.split('%2F').pop()?.split('?')[0]?.replace(/\.[^/.]+$/, '').replace(/_/g, ' ') || 'Pista de Audio';
             
-            let title = meta.title || cleanName;
-            let artist = meta.artist || 'Desconocido';
-            let needsRepair = false;
-
-            if (!meta.title || !meta.artist || meta.artist.toLowerCase().includes('unknown') || artist === 'Desconocido') {
-              needsRepair = true;
-            }
-
-            let artworkUri = meta.artwork_thumb;
-            let thumbUri = meta.artwork_thumb;
-
-            const linkedLyrics = await findAndLinkLyricsNative(asset);
-            const embeddedLyricsLrc = meta.lyrics_lrc || undefined;
-            const effectiveLyricsLrc = embeddedLyricsLrc || linkedLyrics || undefined;
-            const lyricsSource = meta.lyrics_source || (linkedLyrics ? 'companion_lrc' : undefined);
+            const extension = rawName.split('?')[0].split('.').pop()?.toLowerCase() || '';
+            const sourceUri = asset.sourceUri || asset.uri;
+            const playableUri = sanitizeTrackUriForPlayback(asset.uri || sourceUri);
 
             batchTracks.push({
-              id: asset.uri,
-              url: asset.uri,
-              title,
-              artist,
-              album: meta.album || 'Carpeta de Música',
-              duration: Math.round((meta as any).duration || asset.duration || 180),
-              qualityBadge: getFileQualityBadge(decodeURIComponentSafe(asset.filename || asset.uri || '')),
-              artwork: artworkUri,
-              artwork_thumb: thumbUri,
-              bpm: meta.bpm,
-              key: meta.key,
-              replayGainTrack: meta.replayGainTrack,
-              replayGainAlbum: meta.replayGainAlbum,
-              needs_repair: needsRepair as any,
-              lyrics_lrc: effectiveLyricsLrc,
-              lyrics_ttml: meta.lyrics_ttml || undefined,
-              lyrics_plain: meta.lyrics_plain || undefined,
-              lyrics_source: lyricsSource,
-              lyrics: effectiveLyricsLrc || meta.lyrics_plain || undefined,
+              id: asset.canonicalId || sourceUri,
+              url: playableUri || sourceUri,
+              source_uri: sourceUri,
+              file_extension: extension,
+              title: cleanName,
+              artist: 'Desconocido',
+              album: 'Carpeta de Musica',
+              duration: Math.round(asset.duration || 180),
+              qualityBadge: getFileQualityBadge(decodeURIComponentSafe(asset.filename || asset.sourceUri || asset.uri || '')),
+              needs_repair: true,
+              analysis_status: 'pending',
             });
           } catch (trackErr: any) {
             // Si el procesamiento individual falla por cualquier circunstancia, creamos una pista de respaldo
             const rawName = asset.filename || asset.uri || '';
             const cleanName = decodeURIComponentSafe(rawName).split('/').pop()?.split('%2F').pop()?.split('?')[0]?.replace(/\.[^/.]+$/, '').replace(/_/g, ' ') || 'Pista de Audio';
             batchTracks.push({
-              id: asset.uri,
-              url: asset.uri,
+              id: asset.canonicalId || asset.sourceUri || asset.uri,
+              url: sanitizeTrackUriForPlayback(asset.uri || asset.sourceUri),
+              source_uri: asset.sourceUri || asset.uri,
+              file_extension: (asset.filename || asset.sourceUri || asset.uri || '').split('?')[0].split('.').pop()?.toLowerCase(),
               title: cleanName,
               artist: 'Desconocido',
               album: 'Carpeta de Música',

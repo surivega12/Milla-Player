@@ -20,12 +20,13 @@ export class VertexQueueManager {
   private currentTrack: VertexTrack | null = null;
   private fullCatalog: VertexTrack[] = [];
   private onQueueChangeCallback: (() => void) | null = null;
-  private isAutoMixEnabled: boolean = true;
+  private isAutoMixEnabled: boolean = false;
   private bpmTolerance: number = 3;
   private isSessionAutoMixForced: boolean = false;
   private harmonicMode: 'strict' | 'energy' | 'free' = 'strict';
   private transitionSeconds: number = 6;
   private crossOutEnabled: boolean = true;
+  private volumeNormalizationEnabled: boolean = false;
 
   constructor(catalog: VertexTrack[] = []) {
     this.fullCatalog = catalog;
@@ -54,8 +55,9 @@ export class VertexQueueManager {
       this.harmonicMode = settings.harmonic_mode;
       this.transitionSeconds = settings.crossfade_seconds > 0
         ? Math.min(Math.max(settings.crossfade_seconds, 1), 12)
-        : 6;
+        : 0;
       this.crossOutEnabled = settings.cross_out_enabled;
+      this.volumeNormalizationEnabled = Boolean(settings.volume_normalization);
       if (!this.isAutoMixEnabled && !this.isSessionAutoMixForced) {
         this.autoMixQueue = [];
       } else {
@@ -87,6 +89,10 @@ export class VertexQueueManager {
 
   public isCrossOutEnabled(): boolean {
     return this.crossOutEnabled;
+  }
+
+  public isVolumeNormalizationEnabled(): boolean {
+    return this.volumeNormalizationEnabled;
   }
 
   public getCatalogTrack(trackId: string): VertexTrack | null {
@@ -231,11 +237,18 @@ export class VertexQueueManager {
       referenceTrack.id
     ]);
 
-    const candidates = this.fullCatalog.filter(t => !excludedIds.has(t.id));
+    const allCandidates = this.fullCatalog.filter(t => !excludedIds.has(t.id));
+    const analyzedCandidates = allCandidates.filter((track) =>
+      track.analysis_status === 'ready' && Boolean(track.bpm) && Boolean(track.camelot_key || track.key)
+    );
+    // Once enough tracks have DSP data, do not let unanalysed files outrank a
+    // verified BPM/key transition. Before that point the queue still degrades
+    // gracefully to metadata-based selection.
+    const candidates = analyzedCandidates.length >= 3 ? analyzedCandidates : allCandidates;
 
     const scoredCandidates = candidates.map(candidate => ({
       track: candidate,
-      score: this.calculateMixScore(referenceTrack, candidate)
+      score: this.calculateMixScore(referenceTrack, candidate) + Math.random() * 0.35
     }));
 
     scoredCandidates.sort((a, b) => b.score - a.score);
@@ -258,7 +271,7 @@ export class VertexQueueManager {
       else if (bpmDiffPercent > 0.05) score -= 30;
       else score += (this.bpmTolerance - bpmDiff) * 10;
     } else {
-      score -= 20;
+      score -= 32;
     }
 
     const currentKey = current.camelotKey || current.camelot_key || current.key || '';
@@ -282,7 +295,27 @@ export class VertexQueueManager {
       score += Math.max(-20, 24 - energyDifference * 60);
     }
 
-    if (next.analysis_status === 'ready') score += 15;
+    const currentGenre = String(current.genre || '').trim().toLocaleLowerCase('es');
+    const nextGenre = String(next.genre || '').trim().toLocaleLowerCase('es');
+    if (currentGenre && nextGenre) {
+      const currentGenres = new Set(currentGenre.split(/[;,/|]/).map((value) => value.trim()).filter(Boolean));
+      const nextGenres = new Set(nextGenre.split(/[;,/|]/).map((value) => value.trim()).filter(Boolean));
+      const sharesGenre = [...currentGenres].some((genre) => nextGenres.has(genre));
+      score += sharesGenre ? 18 : -4;
+    }
+
+    // Prefer a natural exit and a short, energetic entrance when DSP data exists.
+    if (current.outro_start_ms && current.duration) {
+      const outroSeconds = Math.max(0, current.duration - current.outro_start_ms / 1000);
+      score += outroSeconds >= 3 && outroSeconds <= 16 ? 8 : -3;
+    }
+    if (next.intro_duration_ms != null) {
+      score += next.intro_duration_ms <= 12000 ? 6 : 0;
+    }
+
+    if (next.analysis_status === 'ready') score += 22;
+    else score -= 24;
+    if (!next.camelot_key && !next.camelotKey && !next.key) score -= 18;
 
     return score;
   }

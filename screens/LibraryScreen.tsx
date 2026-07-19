@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   View,
   Text,
@@ -8,7 +8,6 @@ import {
   Dimensions,
   ActivityIndicator,
   RefreshControl,
-  InteractionManager,
 } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import Animated, { useSharedValue, useAnimatedScrollHandler } from 'react-native-reanimated';
@@ -31,10 +30,8 @@ import { TrackOptionsModal } from '../components/TrackOptionsModal';
 import { Track } from '../components/PlayerBar';
 import { getThemeColors } from '../utils/theme-colors';
 import { useTheme } from '../context/ThemeContext';
-import { getCachedTracks, insertTracks } from '../services/database-service';
+import { getCachedTracks } from '../services/database-service';
 import { globalVertexQueueManager } from '../services/queue-service';
-import { extractMetadata } from '../services/metadata-service';
-import { sanitizeTrackUriForPlayback } from '../services/library-service';
 
 const { width } = Dimensions.get('window');
 const COLUMN_COUNT = 1;
@@ -118,11 +115,6 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [sortBy, setSortBy] = useState<SortOption>('title');
   const [filterLosslessOnly, setFilterLosslessOnly] = useState<boolean>(false);
-  const artworkRequestsRef = useRef<Set<string>>(new Set());
-  const artworkFailureCountsRef = useRef<Map<string, number>>(new Map());
-  const visibleTrackIdsRef = useRef<Set<string>>(new Set());
-  const [visibleRevision, setVisibleRevision] = useState(0);
-
   const scrollY = useSharedValue(0);
   const headerTranslationY = useSharedValue(0);
 
@@ -176,73 +168,6 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
 
   // Las carátulas se hidratan con la ruta local ya saneada y se guardan nuevamente en SQLite.
   // Un conjunto de solicitudes evita releer el mismo archivo durante actualizaciones de la lista.
-  useEffect(() => {
-    let cancelled = false;
-    const candidates = localTracks.filter((track) => {
-      const hasArtwork = Boolean(track.artwork_thumb || track.artwork);
-      return visibleTrackIdsRef.current.has(track.id) &&
-        !hasArtwork &&
-        Boolean(track.url || track.id) &&
-        !artworkRequestsRef.current.has(track.id);
-    }).slice(0, 16);
-
-    if (candidates.length === 0) return () => { cancelled = true; };
-    candidates.forEach((track) => artworkRequestsRef.current.add(track.id));
-
-    const hydrateArtwork = async () => {
-      const BATCH_SIZE = 2;
-      const hydratedTracks: Track[] = [];
-
-      for (let index = 0; index < candidates.length && !cancelled; index += BATCH_SIZE) {
-        const batch = candidates.slice(index, index + BATCH_SIZE);
-        const results = await Promise.all(batch.map(async (track) => {
-          try {
-            const playableUri = sanitizeTrackUriForPlayback(track.url || track.id);
-            const metadata = await extractMetadata(playableUri, track.id);
-            if (!metadata.artwork_thumb) return null;
-            return {
-              ...track,
-              url: playableUri,
-              artwork: metadata.artwork_thumb,
-              artwork_thumb: metadata.artwork_thumb,
-            };
-          } catch {
-            return null;
-          }
-        }));
-
-        const foundArtwork = results.filter(
-          (track): track is NonNullable<typeof track> => track !== null
-        );
-        hydratedTracks.push(...foundArtwork);
-      }
-
-      if (hydratedTracks.length > 0 && !cancelled) {
-        const byId = new Map(hydratedTracks.map((track) => [track.id, track]));
-        setLocalTracks((current) => current.map((track) => byId.get(track.id) || track));
-        await insertTracks(hydratedTracks).catch((error) => {
-          console.warn('No se pudieron persistir las caratulas extraidas:', error);
-        });
-      }
-    };
-
-    const interaction = InteractionManager.runAfterInteractions(hydrateArtwork);
-    return () => {
-      cancelled = true;
-      interaction.cancel();
-    };
-  }, [localTracks, visibleRevision]);
-
-  const onViewableItemsChanged = useRef(({ viewableItems }: { viewableItems: Array<{ item?: Track }> }) => {
-    const nextIds = new Set(viewableItems.map((entry) => entry.item?.id).filter((id): id is string => Boolean(id)));
-    const previousIds = visibleTrackIdsRef.current;
-    const changed = nextIds.size !== previousIds.size || [...nextIds].some((id) => !previousIds.has(id));
-    if (changed) {
-      visibleTrackIdsRef.current = nextIds;
-      setVisibleRevision((value) => value + 1);
-    }
-  }).current;
-
   const handleRefresh = async () => {
     setIsRefreshing(true);
     await loadTracksFromDatabase(false);
@@ -297,9 +222,6 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
   );
 
   const handleArtworkError = useCallback((trackId: string) => {
-    const failures = (artworkFailureCountsRef.current.get(trackId) || 0) + 1;
-    artworkFailureCountsRef.current.set(trackId, failures);
-    if (failures <= 1) artworkRequestsRef.current.delete(trackId);
     setLocalTracks((current) => current.map((track) =>
       track.id === trackId
         ? { ...track, artwork: undefined, artwork_thumb: undefined }
@@ -449,7 +371,6 @@ export const LibraryScreen: React.FC<LibraryScreenProps> = ({
             scrollEventThrottle={16}
             {...({ estimatedItemSize: 69 } as any)}
             numColumns={COLUMN_COUNT}
-            onViewableItemsChanged={onViewableItemsChanged}
             viewabilityConfig={{ itemVisiblePercentThreshold: 20, minimumViewTime: 120 }}
             contentContainerStyle={{ paddingBottom: 130 }}
             showsVerticalScrollIndicator={false}

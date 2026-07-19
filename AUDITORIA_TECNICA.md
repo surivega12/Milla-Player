@@ -2,7 +2,7 @@
 
 ## Resumen del proyecto
 
-Milla es un reproductor local para Android construido con Expo 57, React Native 0.86 y React 19. Su catalogo principal vive en SQLite (`milla.db`), el audio se reproduce con React Native Track Player y el backend Django actua como cache de letras y motor DSP opcional. La aplicacion tambien incluye busqueda/reparacion de metadatos, biblioteca por MediaStore o SAF, descargas, historial, temas y una cola inteligente Auto Mix.
+Milla es un reproductor local para Android construido con Expo 57, React Native 0.86 y React 19. Su catalogo principal vive en SQLite (`milla.db`), el audio se reproduce con Expo Audio mediante `services/player-engine.ts` y el backend Django actua como cache de letras y motor DSP opcional. La aplicacion tambien incluye busqueda/reparacion de metadatos, biblioteca por MediaStore o SAF, descargas, historial, temas y una cola inteligente Auto Mix.
 
 ## Flujo de datos
 
@@ -10,7 +10,7 @@ Milla es un reproductor local para Android construido con Expo 57, React Native 
 2. `library-service.ts` obtiene audio global mediante MediaLibrary o recorre una carpeta SAF.
 3. Las URI SAF de External Storage se convierten a `file://` y se guardan saneadas en SQLite.
 4. `metadata-service.ts` lee etiquetas y caratulas por bloques para FLAC, MP3 y M4A; los formatos restantes usan el lector tolerante anterior.
-5. `audio-service.ts` valida cada URI antes de entregarla a Track Player.
+5. `audio-service.ts` valida cada URI antes de entregarla al motor Expo Audio.
 6. `queue-service.tsx` calcula la siguiente pista usando prioridad manual, BPM y rueda Camelot.
 7. `playback-service.ts` mantiene una sola pista futura preparada y aplica transiciones de volumen.
 8. `LyricsModal.tsx` usa `am-lyrics` para letras interpoladas en linea y conserva la letra LRC local como modo sin conexion.
@@ -21,7 +21,7 @@ Milla es un reproductor local para Android construido con Expo 57, React Native 
 | --- | --- | --- |
 | Expo MediaLibrary | Permiso granular y escaneo global de audio | Solo solicita `audio`; pagina hasta 10.000 recursos. |
 | Expo FileSystem/SAF | Selector y recursion de carpetas | Evita confiar en `isDirectory` para documentos SAF y prueba la lectura de subdirectorios. |
-| React Native Track Player | Reproduccion, seek, controles del sistema y cola | Toda URI pasa por saneamiento y validacion antes de `add()`. |
+| Expo Audio + `player-engine.ts` | Reproduccion, seek, pantalla bloqueada y cola | Compatible con Expo 57; toda URI pasa por saneamiento y validacion antes de cargarse. |
 | Expo SQLite | Catalogo, letras, BPM, historial y ajustes | El catalogo se carga al arrancar y no depende de un escaneo nuevo. |
 | `@missingcore/audio-metadata` | Etiquetas y caratulas embebidas | Lectura parcial por posicion/longitud para evitar cargar el audio completo. |
 | `@uimaxbai/am-lyrics` | Letras LyricsPlus/Apple, TTML y animacion por palabra | Ejecutado dentro de Expo DOM; no se importa como componente nativo. |
@@ -54,7 +54,7 @@ Milla es un reproductor local para Android construido con Expo 57, React Native 
 - El seek se limita a la duracion valida y cualquier error nativo queda capturado.
 - El microfono abre directamente Letras desde el mini reproductor y desde Now Playing.
 - El modo Onda usa el componente oficial `am-lyrics`, autoscroll, interpolacion y `requestAnimationFrame`.
-- Tocar una linea envia su tiempo en milisegundos al puente DOM y luego a `TrackPlayer.seekTo()` en segundos.
+- Tocar una linea envia su tiempo en milisegundos al puente DOM y luego al motor nativo en segundos.
 - El boton globo alterna Onda/en linea y LRC local; Actualizar vuelve a consultar; Reloj ajusta el desfase visual.
 
 ## Auto Mix
@@ -67,7 +67,7 @@ Milla es un reproductor local para Android construido con Expo 57, React Native 
 - Se elimino la exclusion mutua que apagaba Auto Mix al configurar crossfade o cross-out.
 - El final se desvanece y la pista siguiente recupera gradualmente ReplayGain.
 
-React Native Track Player expone un solo deck. Por ello esta implementacion ofrece seleccion armonica y fade secuencial estable, pero no superpone dos audios ni sincroniza beats en paralelo. Un crossfade DJ real con dos canciones simultaneas requiere un modulo nativo de doble deck (ExoPlayer/Oboe) y analisis fiable de beat-grid, no solo BPM.
+El motor actual usa un solo decodificador. Por ello ofrece seleccion armonica y fade secuencial estable, pero no superpone dos audios ni sincroniza beats en paralelo. Un crossfade DJ real con dos canciones simultaneas requiere un modulo nativo de doble deck y analisis fiable de beat-grid, no solo BPM.
 
 ## Seguridad y DevOps
 
@@ -81,11 +81,11 @@ React Native Track Player expone un solo deck. Por ello esta implementacion ofre
 ## Validacion realizada
 
 - `npx tsc --noEmit --skipLibCheck`: correcto.
-- `npx expo-doctor`: 20/20 comprobaciones.
-- `python manage.py check`: sin problemas.
-- `npx expo export --platform android --clear`: bundle Hermes y bundle DOM generados correctamente.
+- `npx expo-doctor --verbose`: 20/20 comprobaciones correctas.
+- `npx expo config --type public`: configuracion y plugins resueltos correctamente.
+- `npx expo export --platform android`: bundle Hermes y bundle DOM generados correctamente.
 - `npm audit --omit=dev`: sin vulnerabilidades altas o criticas; quedan 16 moderadas transitivas cuya correccion propuesta degrada Expo y no es compatible.
 
 ## Validacion pendiente en hardware
 
-La compilacion estatica no puede sustituir una prueba con la biblioteca real del telefono. El APK debe probarse al menos con Android 11, Android 13+ y, si aplica, una tarjeta SD. Proveedores SAF distintos de `com.android.externalstorage.documents` pueden no exponer una ruta fisica; para esos proveedores haria falta copiar el documento al almacenamiento privado de la app mediante un modulo nativo, conservando el permiso persistente.
+La compilacion estatica no puede sustituir una prueba con la biblioteca real del telefono. El APK debe probarse al menos con Android 11, Android 13+ y, si aplica, una tarjeta SD. Proveedores SAF distintos de `com.android.externalstorage.documents` se copian byte a byte al cache privado de la app para reproducirlos; el cache se limita y conserva la URI original para poder regenerarse. La compilacion Gradle local sigue pendiente por falta de espacio libre en disco.

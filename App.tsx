@@ -18,6 +18,7 @@ import { AlbumsScreen } from './screens/AlbumsScreen';
 import { PlaylistsScreen } from './screens/PlaylistsScreen';
 import { PlaylistPickerModal } from './components/PlaylistPickerModal';
 import { CollectionDetailView } from './components/CollectionDetailView';
+import { AppErrorBoundary } from './components/AppErrorBoundary';
 import { ThemeProvider, useTheme } from './context/ThemeContext';
 
 // Importaciones del Motor de Audio y Persistencia Nativa
@@ -25,9 +26,9 @@ import TrackPlayer, {
   usePlaybackState,
   useActiveTrack,
   State,
-} from 'react-native-track-player';
-import { configureAutoMixQueue, setupPlayer, playPlaylist, restorePlaybackQueue } from './services/audio-service';
-import { isUnresolvedSafUri, scanDeviceAudioFiles, scanManualMusicFolder, sanitizeTrackUriForPlayback } from './services/library-service';
+} from './services/player-engine';
+import { configureAutoMixQueue, playPlaylist } from './services/audio-service';
+import { ensureTrackPlayableUri, hydrateTrackMetadataForPlayback, isTrackPlayerCompatibleUri, scanDeviceAudioFiles, scanManualMusicFolder } from './services/library-service';
 import { getAutoMixSettings, getCachedTracks, initializeVertexDatabase, insertTracks, isTrackFavorite, saveAutoMixSettings, toggleTrackFavorite } from './services/database-service';
 import { searchRecording } from './services/musicbrainz-service';
 import { VertexQueueProvider, useVertexQueue, VertexTrack } from './services/queue-service';
@@ -73,7 +74,6 @@ function MainAppContent() {
   
   // Preferencias de Ajustes
   const [bufferMode, setBufferMode] = useState<'aggressive' | 'balanced' | 'eco'>('aggressive');
-  const [audioQuality, setAudioQuality] = useState<'hires' | 'hq' | 'standard'>('hires');
   const [cacheSize, setCacheSize] = useState<string>('0.0 MB');
 
   // Descargas sin conexión
@@ -121,23 +121,17 @@ function MainAppContent() {
 
         await initializeVertexDatabase();
         const cachedTracks = await getCachedTracks();
-        const playableCachedTracks = cachedTracks.map((track) => {
-          const playableUrl = sanitizeTrackUriForPlayback(track.url || track.id);
-          return playableUrl && playableUrl !== track.url ? { ...track, url: playableUrl } : track;
-        });
-        const migratedCachedTracks = playableCachedTracks.filter((track, index) => track.url !== cachedTracks[index].url);
-        if (migratedCachedTracks.length > 0) {
-          await insertTracks(migratedCachedTracks);
-        }
-        setTracksList(playableCachedTracks);
-        setCatalog(playableCachedTracks as VertexTrack[]);
+        setTracksList(cachedTracks);
+        setCatalog(cachedTracks as VertexTrack[]);
         const autoMixSettings = await getAutoMixSettings();
         await queueManager.syncSettings();
         setIsSmartDJActive(autoMixSettings.enabled);
-        await setupPlayer();
-        await restorePlaybackQueue(playableCachedTracks);
+        // Keep boot independent from the native audio service. TrackPlayer is
+        // initialized by playPlaylist after an intentional user action, which
+        // prevents an Android media-session failure from taking down the
+        // library immediately after the permission dialog.
         setIsDbReady(true);
-        setTimeout(() => syncDownloads(playableCachedTracks).catch(() => {}), 0);
+        setTimeout(() => syncDownloads(cachedTracks).catch(() => {}), 0);
 
         // 🚀 Punto 3.1: Encendido automático y silencioso del Worker en segundo plano tras 5 segundos
         syncTimer = setTimeout(async () => {
@@ -336,20 +330,37 @@ function MainAppContent() {
       const sourceTracks = localUri
         ? tracksList.map((item) => item.id === track.id ? { ...item, url: localUri } : item)
         : tracksList;
+      const selectedTrack = sourceTracks[index >= 0 ? index : 0] || track;
       await playPlaylist(sourceTracks, index >= 0 ? index : 0);
+
+      // Artwork, embedded lyrics and ID3 stay off the navigation path. They
+      // are persisted after the audio has already started.
+      void hydrateTrackMetadataForPlayback(selectedTrack)
+        .then((hydrated) => {
+          setTracksList((current) => current.map((item) => item.id === hydrated.id ? { ...item, ...hydrated } : item));
+          setCurrentTrack((current) => current?.id === hydrated.id ? { ...current, ...hydrated } : current);
+          setQueueCurrentTrack(hydrated as VertexTrack);
+        })
+        .catch((metadataError) => {
+          console.warn('[App] No se pudieron hidratar los metadatos de la pista activa:', metadataError);
+        });
     } catch (error: any) {
       console.error('No se pudo iniciar la pista seleccionada:', error);
       Alert.alert('No se pudo reproducir', error?.message || 'La ruta local de esta pista ya no es accesible. Vuelve a escanearla.');
     }
-  }, [isSmartDJActive, queueManager, tracksList]);
+  }, [isSmartDJActive, queueManager, setQueueCurrentTrack, tracksList]);
 
   const handlePlayPause = async () => {
     if (Platform.OS === 'web') return;
-    const state = typeof playbackState === 'object' && playbackState !== null ? playbackState.state : playbackState;
-    if (state === State.Playing) {
-      await TrackPlayer.pause();
-    } else {
-      await TrackPlayer.play();
+    try {
+      const state = typeof playbackState === 'object' && playbackState !== null ? playbackState.state : playbackState;
+      if (state === State.Playing) {
+        await TrackPlayer.pause();
+      } else {
+        await TrackPlayer.play();
+      }
+    } catch (error) {
+      console.warn('[App] No se pudo cambiar el estado de reproduccion:', error);
     }
   };
 
@@ -364,9 +375,9 @@ function MainAppContent() {
         if (existingIndex >= 0) {
           await TrackPlayer.skip(existingIndex);
         } else {
-          const nextTrackUrl = sanitizeTrackUriForPlayback(nextFromQueue.url || nextFromQueue.id);
-          if (isUnresolvedSafUri(nextTrackUrl)) {
-            throw new Error('La siguiente pista sigue usando una ruta SAF no reproducible. Vuelve a escanearla.');
+          const nextTrackUrl = await ensureTrackPlayableUri(nextFromQueue);
+          if (!isTrackPlayerCompatibleUri(nextTrackUrl)) {
+            throw new Error('La siguiente pista no tiene una ruta local reproducible.');
           }
           await TrackPlayer.add({
             id: nextFromQueue.id,
@@ -596,7 +607,7 @@ function MainAppContent() {
           progressUpdateEventInterval: mode === 'eco' ? 2 : 1,
         });
       }
-      Alert.alert('Buffer Profile', `The audio engine has been set to ${mode.toUpperCase()} mode.`);
+      Alert.alert('Interfaz de reproduccion', `La frecuencia de actualizacion visual se ajusto a ${mode.toUpperCase()}. La calidad del archivo original no se modifica.`);
     } catch (err) {
       console.error('Error updating buffer mode:', err);
     }
@@ -634,11 +645,16 @@ function MainAppContent() {
           </Text>
           <TouchableOpacity
             onPress={async () => {
-              const { status } = await MediaLibrary.requestPermissionsAsync(false, ['audio']);
+              try {
+                const { status } = await MediaLibrary.requestPermissionsAsync(false, ['audio']);
               if (status === 'granted') {
                 setHasPermissions(true);
               } else {
                 Alert.alert('Permiso denegado', 'Por favor, otorga el permiso de archivos para que Milla pueda escanear tu música local.');
+              }
+              } catch (error) {
+                console.warn('[App] No se pudo solicitar el permiso de audio:', error);
+                Alert.alert('Permiso de audio', 'No se pudo abrir el dialogo de permisos. Revisa los ajustes de Android.');
               }
             }}
             className="bg-blue-600 w-full py-4 rounded-2xl items-center shadow-lg"
@@ -671,8 +687,6 @@ function MainAppContent() {
             onSelectTheme={setCurrentTheme}
             bufferMode={bufferMode}
             onSelectBufferMode={handleSelectBufferMode}
-            audioQuality={audioQuality}
-            onSelectAudioQuality={setAudioQuality}
             onClearCache={handleClearCache}
             cacheSize={cacheSize}
             onAutoMixEnabledChange={(enabled) => {
@@ -740,6 +754,7 @@ function MainAppContent() {
             isOptimizing={isOptimizing}
             optimizationProgressText={optimizationProgressText}
             onNavigateToArtists={() => handleSelectTab('artistas')}
+            onAutoMixSessionChange={setIsSmartDJActive}
           />
         )}
 
@@ -836,7 +851,9 @@ export default function App() {
     <SafeAreaProvider>
       <VertexQueueProvider initialCatalog={[] as VertexTrack[]}>
         <ThemeProvider>
-          <MainAppContent />
+          <AppErrorBoundary>
+            <MainAppContent />
+          </AppErrorBoundary>
         </ThemeProvider>
       </VertexQueueProvider>
     </SafeAreaProvider>

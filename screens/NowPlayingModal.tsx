@@ -35,7 +35,7 @@ import {
   Maximize,
 } from 'lucide-react-native';
 import Slider from '@react-native-community/slider';
-import TrackPlayer, { RepeatMode, useProgress } from 'react-native-track-player';
+import TrackPlayer, { RepeatMode, useProgress } from '../services/player-engine';
 import { getThemeColors } from '../utils/theme-colors';
 import { Track } from '../components/PlayerBar';
 import { LyricsModal } from './LyricsModal';
@@ -113,6 +113,8 @@ export const NowPlayingModal: React.FC<NowPlayingModalProps> = ({
 
   const dismissPanResponder = useMemo(() => PanResponder.create({
     onMoveShouldSetPanResponder: (_, gesture) =>
+      gesture.dy > 10 && Math.abs(gesture.dy) > Math.abs(gesture.dx) * 1.2,
+    onMoveShouldSetPanResponderCapture: (_, gesture) =>
       gesture.dy > 10 && Math.abs(gesture.dy) > Math.abs(gesture.dx) * 1.2,
     onPanResponderMove: (_, gesture) => {
       dismissY.value = Math.max(0, gesture.dy);

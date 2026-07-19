@@ -17,7 +17,7 @@ import {
   MoreVertical,
   Trash2,
 } from 'lucide-react-native';
-import TrackPlayer, { Event } from 'react-native-track-player';
+import TrackPlayer, { Event } from '../services/player-engine';
 import { FlashList } from '@shopify/flash-list';
 import { Track } from '../components/PlayerBar';
 import { TrackOptionsModal } from '../components/TrackOptionsModal';

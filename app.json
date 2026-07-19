@@ -41,9 +41,19 @@
         {
           "photosPermission": "Permite a Milla acceder a tu biblioteca de musica y caratulas para el procesamiento Hi-Res y AutoMix offline.",
           "savePhotosPermission": "Permite a Milla guardar caratulas procesadas y optimizadas en tu almacenamiento local.",
-          "granularPermissions": ["audio"]
+          "granularPermissions": [
+            "audio"
+          ]
         }
-      ]
+      ],
+      [
+        "expo-audio",
+        {
+          "enableBackgroundPlayback": true,
+          "recordAudioAndroid": false
+        }
+      ],
+      "expo-asset"
     ],
     "extra": {
       "eas": {

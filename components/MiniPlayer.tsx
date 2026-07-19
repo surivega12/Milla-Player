@@ -19,7 +19,7 @@ import TrackPlayer, {
   usePlaybackState,
   useActiveTrack,
   State,
-} from 'react-native-track-player';
+} from '../services/player-engine';
 
 export interface Track {
   id: string;
@@ -30,6 +30,10 @@ export interface Track {
   duration?: number;
   qualityBadge?: string;
   url?: string;
+  /** Original Android MediaStore/SAF URI kept when `url` is materialized to app cache. */
+  source_uri?: string;
+  /** File extension retained when a virtual content URI has no filename. */
+  file_extension?: string;
   artwork_thumb?: string;
   bpm?: number;
   key?: string;
@@ -102,7 +106,7 @@ export const MiniPlayer: React.FC<MiniPlayerProps> = ({
   onCast,
 }) => {
   const { colors } = useTheme();
-  // Conexión en vivo con react-native-track-player
+  // Conexion en vivo con el motor nativo Expo Audio.
   const progressData = useProgress();
   const activeTrackData = useActiveTrack();
   const playbackState = usePlaybackState();

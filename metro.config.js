@@ -18,12 +18,6 @@ config.resolver.resolveRequest = (context, moduleName, platform) => {
   ) {
     return context.resolveRequest(context, "expo-file-system/legacy", platform);
   }
-  if (platform === "web" && moduleName === "react-native-track-player") {
-    return {
-      filePath: path.resolve(__dirname, "services/track-player-mock.web.ts"),
-      type: "sourceFile",
-    };
-  }
   if (platform === "web" && moduleName === "react-native-safe-area-context") {
     return {
       filePath: path.resolve(__dirname, "services/safe-area-context-mock.web.ts"),

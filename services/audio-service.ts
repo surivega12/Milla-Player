@@ -1,20 +1,17 @@
-import TrackPlayer, {
-  AppKilledPlaybackBehavior,
-  Capability,
-  RepeatMode,
-} from 'react-native-track-player';
+import TrackPlayer, { RepeatMode } from './player-engine';
 import { Platform } from 'react-native';
 import { Track } from '../components/PlayerBar';
 import { globalVertexQueueManager } from './queue-service';
-import { isUnresolvedSafUri, sanitizeTrackUriForPlayback } from './library-service';
+import { ensureTrackPlayableUri, isTrackPlayerCompatibleUri } from './library-service';
 import { getQueueSnapshot, saveQueueSnapshot } from './database-service';
 
-function toTrackPlayerTrack(track: Track) {
-  const sourceUri = track.url || track.id;
-  const playableUri = sanitizeTrackUriForPlayback(sourceUri);
+let playerSetupPromise: Promise<boolean> | null = null;
+let playerInitialized = false;
 
-  if (!playableUri || isUnresolvedSafUri(playableUri)) {
-    throw new Error(`La pista "${track.title || track.id}" sigue usando una URI SAF no reproducible. Vuelve a escanear la carpeta.`);
+async function toTrackPlayerTrack(track: Track) {
+  const playableUri = await ensureTrackPlayableUri(track);
+  if (!playableUri || !isTrackPlayerCompatibleUri(playableUri)) {
+    throw new Error(`La pista "${track.title || track.id}" no tiene una ruta local reproducible.`);
   }
 
   return {
@@ -43,56 +40,20 @@ export async function setupPlayer(): Promise<boolean> {
     return true;
   }
 
-  let isSetup = false;
-  try {
-    // En TrackPlayer v4/v5, getActiveTrack verifica si el reproductor ya está inicializado
-    await TrackPlayer.getActiveTrack();
-    isSetup = true;
-  } catch (e) {
-    // Inicializar el reproductor con búfer optimizado para archivos FLAC Hi-Res grandes
-    await TrackPlayer.setupPlayer({
-      minBuffer: 2,
-      maxBuffer: 30,
-      playBuffer: 0.5,
-      backBuffer: 15,
-      maxCacheSize: 1024 * 1024 * 50, // Caché de 50 MB para streams; los archivos locales no se duplican.
-      waitForBuffer: true,
-    } as any);
+  if (playerInitialized) return true;
+  if (playerSetupPromise) return playerSetupPromise;
 
-    // Configurar de forma estricta las 'Capability' nativas para la barra de notificaciones y pantalla de bloqueo de Android
-    await TrackPlayer.updateOptions({
-      android: {
-        appKilledPlaybackBehavior: AppKilledPlaybackBehavior.StopPlaybackAndRemoveNotification,
-        alwaysPauseOnInterruption: true,
-      },
-      capabilities: [
-        Capability.Play,
-        Capability.Pause,
-        Capability.SkipToNext,
-        Capability.SkipToPrevious,
-        Capability.SeekTo,
-      ],
-      compactCapabilities: [
-        Capability.Play,
-        Capability.Pause,
-        Capability.SkipToNext,
-        Capability.SkipToPrevious,
-      ],
-      notificationCapabilities: [
-        Capability.Play,
-        Capability.Pause,
-        Capability.SkipToNext,
-        Capability.SkipToPrevious,
-        Capability.SeekTo,
-      ],
-      progressUpdateEventInterval: 1, // Eventos de progreso cada segundo
-    } as any);
-
-    // Configurar repetición predeterminada en apagado
+  playerSetupPromise = (async () => {
+    await TrackPlayer.setupPlayer();
+    await TrackPlayer.updateOptions({ progressUpdateEventInterval: 0.25 });
     await TrackPlayer.setRepeatMode(RepeatMode.Off);
-    isSetup = true;
-  }
-  return isSetup;
+    playerInitialized = true;
+    return true;
+  })().finally(() => {
+    playerSetupPromise = null;
+  });
+
+  return playerSetupPromise;
 }
 
 export async function playTrack(track: Track) {
@@ -108,7 +69,7 @@ export async function playTrack(track: Track) {
   await TrackPlayer.reset();
 
   // Agregar la pista al reproductor nativo (100% archivos locales reales)
-  await TrackPlayer.add(toTrackPlayerTrack(track));
+  await TrackPlayer.add(await toTrackPlayerTrack(track));
 
   await TrackPlayer.play();
 }
@@ -126,29 +87,18 @@ export async function playPlaylist(tracks: Track[], startIndex: number = 0) {
   await setupPlayer();
   const safeStartIndex = Math.max(0, Math.min(startIndex, Math.max(tracks.length - 1, 0)));
   globalVertexQueueManager.setCatalog(tracks);
-  let selectedTracks = tracks;
-  let selectedStartIndex = safeStartIndex;
+  const current = tracks[safeStartIndex];
 
   if (tracks.length > 0 && globalVertexQueueManager.isAutoMixActive()) {
-    const current = tracks[safeStartIndex];
     globalVertexQueueManager.setCurrentTrack(current);
-    const next = globalVertexQueueManager.peekNextTrack();
-    selectedTracks = next && next.id !== current.id ? [current, next] : [current];
-    selectedStartIndex = 0;
-  } else {
-    const windowStart = Math.max(0, safeStartIndex - 2);
-    const windowEnd = Math.min(tracks.length, safeStartIndex + 41);
-    selectedTracks = tracks.slice(windowStart, windowEnd);
-    selectedStartIndex = safeStartIndex - windowStart;
   }
 
-  const playlist = selectedTracks.map(toTrackPlayerTrack);
+  // Do not materialize the following file before playback starts. A large FLAC
+  // selected from a content:// library must not make the tap feel frozen.
+  const payload = await toTrackPlayerTrack(current);
 
   await TrackPlayer.reset();
-  await TrackPlayer.add(playlist);
-  if (selectedStartIndex > 0 && selectedStartIndex < playlist.length) {
-    await TrackPlayer.skip(selectedStartIndex);
-  }
+  await TrackPlayer.add(payload);
   await persistPlaybackQueue();
   await TrackPlayer.play();
 }
@@ -184,10 +134,10 @@ export async function enqueueTrack(track: Track, asNext: boolean = false): Promi
     if (existingIndex >= 0) {
       if (existingIndex !== destination) await TrackPlayer.move(existingIndex, destination);
     } else {
-      await TrackPlayer.add(toTrackPlayerTrack(track), destination);
+      await TrackPlayer.add(await toTrackPlayerTrack(track), destination);
     }
   } else if (existingIndex < 0) {
-    await TrackPlayer.add(toTrackPlayerTrack(track));
+    await TrackPlayer.add(await toTrackPlayerTrack(track));
   }
   await persistPlaybackQueue();
 }
@@ -224,11 +174,26 @@ export async function restorePlaybackQueue(tracks: Track[]): Promise<void> {
     ? restored.findIndex((track) => track.id === snapshot.activeTrackId)
     : 0;
   const activeIndex = requestedIndex >= 0 ? requestedIndex : 0;
-  const windowStart = Math.max(0, activeIndex - 2);
-  const window = restored.slice(windowStart, activeIndex + 41);
-  await TrackPlayer.add(window.map(toTrackPlayerTrack));
-  const localActiveIndex = activeIndex - windowStart;
-  if (localActiveIndex > 0) await TrackPlayer.skip(localActiveIndex);
+  const restoreCandidates = [
+    ...restored.slice(activeIndex),
+    ...restored.slice(0, activeIndex),
+  ].slice(0, 3);
+  let queuePayload: Awaited<ReturnType<typeof toTrackPlayerTrack>> | null = null;
+  const invalidIds = new Set<string>();
+  for (const track of restoreCandidates) {
+    try {
+      queuePayload = await toTrackPlayerTrack(track);
+      break;
+    } catch (error) {
+      invalidIds.add(track.id);
+      console.warn(`[AudioService] Se omitio una pista invalida al restaurar la cola: ${track.id}`, error);
+    }
+  }
+  if (queuePayload) await TrackPlayer.add(queuePayload);
+  if (invalidIds.size > 0) {
+    const repairedIds = snapshot.trackIds.filter((id) => !invalidIds.has(id));
+    await saveQueueSnapshot(repairedIds, repairedIds.includes(snapshot.activeTrackId || '') ? snapshot.activeTrackId : repairedIds[0]);
+  }
 }
 
 export async function configureAutoMixQueue(
@@ -251,15 +216,17 @@ export async function configureAutoMixQueue(
   if (enabled) {
     globalVertexQueueManager.setCurrentTrack(currentTrack);
     const next = globalVertexQueueManager.peekNextTrack();
-    if (next) await TrackPlayer.add(toTrackPlayerTrack(next), activeIndex + 1);
+    if (next) await TrackPlayer.add(await toTrackPlayerTrack(next), activeIndex + 1);
     await persistPlaybackQueue();
     return;
   }
 
   const catalogIndex = tracks.findIndex((track) => track.id === currentTrack.id);
-  const remainingTracks = catalogIndex >= 0 ? tracks.slice(catalogIndex + 1, catalogIndex + 41) : [];
+  const remainingTracks = catalogIndex >= 0 ? tracks.slice(catalogIndex + 1, catalogIndex + 2) : [];
   if (remainingTracks.length > 0) {
-    await TrackPlayer.add(remainingTracks.map(toTrackPlayerTrack), activeIndex + 1);
+    const payloads: Awaited<ReturnType<typeof toTrackPlayerTrack>>[] = [];
+    for (const track of remainingTracks) payloads.push(await toTrackPlayerTrack(track));
+    await TrackPlayer.add(payloads, activeIndex + 1);
   }
   await persistPlaybackQueue();
 }

@@ -9,8 +9,8 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as Network from 'expo-network';
 import { Platform } from 'react-native';
 import { Track } from '../components/PlayerBar';
-import { getTracksNeedingSync, updateTrackAnalysis } from './database-service';
-import { isUnresolvedSafUri, sanitizeTrackUriForPlayback } from './library-service';
+import { getAppSetting, getTracksNeedingSync, saveAppSetting, updateTrackAnalysis } from './database-service';
+import { sanitizeTrackUriForPlayback } from './library-service';
 
 export interface SyncOptions {
   batchSize?: number;
@@ -46,6 +46,52 @@ const DEFAULT_BACKEND_URL = 'http://10.0.2.2:8000';
 const CONFIGURED_BACKEND_URL = (
   process.env.EXPO_PUBLIC_MILLA_API_URL || (__DEV__ ? DEFAULT_BACKEND_URL : '')
 ).replace(/\/$/, '');
+const BACKEND_URL_SETTING = 'backend_url';
+
+function isPrivateHttpHost(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  if (host === 'localhost' || host === '10.0.2.2' || host === '::1' || host.startsWith('127.')) return true;
+  const parts = host.split('.').map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  if (parts[0] === 10 || (parts[0] === 192 && parts[1] === 168)) return true;
+  return parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31;
+}
+
+function normalizeBackendUrl(value: string): string {
+  const candidate = String(value || '').trim();
+  if (!candidate) return '';
+  try {
+    const url = new URL(candidate);
+    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password) return '';
+    if (url.protocol === 'http:' && !isPrivateHttpHost(url.hostname)) return '';
+    if (url.pathname !== '/' || url.search || url.hash) return '';
+    return url.toString().replace(/\/$/, '');
+  } catch {
+    return '';
+  }
+}
+
+export async function getBackendUrl(override?: string): Promise<string> {
+  const configured = override !== undefined
+    ? override
+    : (await getAppSetting(BACKEND_URL_SETTING)) || CONFIGURED_BACKEND_URL;
+  return normalizeBackendUrl(configured);
+}
+
+export async function saveBackendUrl(value: string): Promise<string> {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    await saveAppSetting(BACKEND_URL_SETTING, '');
+    return '';
+  }
+  const normalized = normalizeBackendUrl(raw);
+  if (!normalized) {
+    throw new Error('Usa una URL http privada de tu Wi-Fi o una URL https valida, sin ruta adicional.');
+  }
+  const saved = await saveAppSetting(BACKEND_URL_SETTING, normalized);
+  if (!saved) throw new Error('No se pudo guardar la URL del servidor local.');
+  return normalized;
+}
 
 function hasStoredLyrics(track: Track): boolean {
   return Boolean(
@@ -73,8 +119,8 @@ export const checkCanSync = async (
   if (Platform.OS === 'web') return { canSync: false, reason: 'ENTORNO_WEB' };
   try {
     const networkState = await Network.getNetworkStateAsync();
-    if (!networkState.isConnected || !networkState.isInternetReachable) {
-      return { canSync: false, reason: 'SIN_INTERNET' };
+    if (!networkState.isConnected) {
+      return { canSync: false, reason: 'SIN_RED' };
     }
     if (networkState.type === Network.NetworkStateType.CELLULAR && !forceOnCellular) {
       return { canSync: false, reason: 'DATOS_MOVILES_DETECTADOS' };
@@ -86,6 +132,9 @@ export const checkCanSync = async (
     ) {
       return { canSync: false, reason: 'NO_ES_WIFI' };
     }
+    // A local Django server may be reachable on Wi-Fi even when that network
+    // has no route to the public Internet. It can still serve cached lyrics
+    // and perform local DSP, so do not reject the LAN solely for that reason.
     return { canSync: true };
   } catch (error) {
     console.warn('[SyncService] No se pudo consultar el tipo de red:', error);
@@ -106,6 +155,52 @@ function mapLyricsResult(item: any): AnalysisUpdate {
     update.lyrics_source = String(item.source || 'api');
   }
   return update;
+}
+
+/**
+ * Resolves lyrics only. Unlike syncSingleTrack, this endpoint never uploads
+ * the audio file or starts DSP work, so opening the microphone stays light.
+ */
+export async function syncLyricsForTrack(
+  track: Track,
+  backendUrl?: string
+): Promise<AnalysisUpdate> {
+  const resolvedBackendUrl = await getBackendUrl(backendUrl);
+  if (!track?.id || !resolvedBackendUrl || Platform.OS === 'web') return {};
+  const networkCheck = await checkCanSync(false);
+  if (!networkCheck.canSync) return {};
+
+  try {
+    const response = await fetchWithTimeout(`${resolvedBackendUrl}/api/lyrics/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        tracks: [{
+          track_id: track.id,
+          id: track.id,
+          title: track.title || '',
+          artist: track.artist || '',
+          album: track.album || '',
+          duration: track.duration || 0,
+        }],
+      }),
+    }, 12000);
+    if (!response.ok) return {};
+
+    const payload = await response.json();
+    const item = (payload?.results || [])[0] ?? payload;
+    const update = mapLyricsResult(item);
+    if (Object.keys(update).length > 0) {
+      await updateTrackAnalysis(track.id, update);
+      return update;
+    }
+    if (item && item.success === false) {
+      await updateTrackAnalysis(track.id, { lyrics_source: 'not_found' });
+    }
+  } catch (error) {
+    console.warn(`[SyncService] No se pudieron resolver letras para ${track.id}:`, error);
+  }
+  return {};
 }
 
 function mapDspResult(item: any): AnalysisUpdate {
@@ -150,65 +245,118 @@ function mimeTypeForUri(uri: string): string {
   return mimeTypes[extension || ''] || 'application/octet-stream';
 }
 
+const MAX_ANALYSIS_FILE_BYTES = 750 * 1024 * 1024;
+
+function stableTemporaryFileName(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index++) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function inferAnalysisExtension(track: Track): string {
+  const rawExtension = String(track.file_extension || '').replace(/^\./, '').toLowerCase();
+  if (/^(mp3|flac|wav|m4a|aac|ogg|opus|dsf|dff)$/.test(rawExtension)) return `.${rawExtension}`;
+  const candidate = String(track.source_uri || track.url || '').split('?')[0];
+  const extension = candidate.split('.').pop()?.toLowerCase() || '';
+  if (/^(mp3|flac|wav|m4a|aac|ogg|opus|dsf|dff)$/.test(extension)) return `.${extension}`;
+  const badge = String(track.qualityBadge || '').toLowerCase();
+  if (badge.includes('flac')) return '.flac';
+  if (badge.includes('wav')) return '.wav';
+  if (badge.includes('dsd')) return '.dsf';
+  if (badge.includes('aac')) return '.aac';
+  if (badge.includes('ogg')) return '.ogg';
+  return '.mp3';
+}
+
+async function prepareTrackForAnalysis(track: Track): Promise<{ uri: string; temporary: boolean }> {
+  const directCandidates = [track.url, track.source_uri, track.id]
+    .filter((value): value is string => Boolean(value));
+  for (const candidate of directCandidates) {
+    const fileUri = sanitizeTrackUriForPlayback(candidate);
+    if (!fileUri.startsWith('file://')) continue;
+    const info = await FileSystem.getInfoAsync(fileUri).catch(() => null);
+    if (info?.exists && !info.isDirectory) {
+      if (Number(info.size || 0) > MAX_ANALYSIS_FILE_BYTES) throw new Error('ARCHIVO_SUPERA_LIMITE_DSP');
+      return { uri: fileUri, temporary: false };
+    }
+  }
+
+  const sourceUri = directCandidates.find((candidate) => candidate.startsWith('content://'));
+  if (!sourceUri || !FileSystem.cacheDirectory) throw new Error('RUTA_LOCAL_NO_ACCESIBLE');
+  const directory = `${FileSystem.cacheDirectory}milla-analysis/`;
+  await FileSystem.makeDirectoryAsync(directory, { intermediates: true }).catch(() => {});
+  const tempUri = `${directory}${stableTemporaryFileName(`${track.id}:${sourceUri}:${Date.now()}`)}${inferAnalysisExtension(track)}`;
+  await FileSystem.copyAsync({ from: sourceUri, to: tempUri });
+  const copied = await FileSystem.getInfoAsync(tempUri).catch(() => null);
+  if (!copied?.exists || copied.isDirectory || Number(copied.size || 0) <= 0) {
+    await FileSystem.deleteAsync(tempUri, { idempotent: true }).catch(() => {});
+    throw new Error('CONTENT_COPY_FAILED');
+  }
+  if (Number(copied.size || 0) > MAX_ANALYSIS_FILE_BYTES) {
+    await FileSystem.deleteAsync(tempUri, { idempotent: true }).catch(() => {});
+    throw new Error('ARCHIVO_SUPERA_LIMITE_DSP');
+  }
+  return { uri: tempUri, temporary: true };
+}
+
 export async function uploadTrackForAnalysis(
   track: Track,
-  backendUrl: string = CONFIGURED_BACKEND_URL,
+  backendUrl?: string,
   onUploadProgress?: (progress: number) => void
 ): Promise<{ success: boolean; data?: any; reason?: string }> {
+  const resolvedBackendUrl = await getBackendUrl(backendUrl);
   if (Platform.OS === 'web') return { success: false, reason: 'ENTORNO_WEB' };
-  if (!backendUrl) return { success: false, reason: 'BACKEND_NO_CONFIGURADO' };
+  if (!resolvedBackendUrl) return { success: false, reason: 'BACKEND_NO_CONFIGURADO' };
 
-  const fileUri = sanitizeTrackUriForPlayback(track.url || track.id);
-  if (!fileUri || fileUri.startsWith('http') || fileUri.startsWith('content://') || isUnresolvedSafUri(fileUri)) {
-    return { success: false, reason: 'RUTA_LOCAL_NO_ACCESIBLE' };
-  }
-
-  const fileInfo = await FileSystem.getInfoAsync(fileUri).catch(() => null);
-  if (!fileInfo?.exists || fileInfo.isDirectory) {
-    return { success: false, reason: 'ARCHIVO_NO_ENCONTRADO' };
-  }
-
-  const cleanUrl = backendUrl.replace(/\/$/, '');
-  const task = FileSystem.createUploadTask(
-    `${cleanUrl}/api/analyze/`,
-    fileUri,
-    {
-      httpMethod: 'POST',
-      uploadType: FileSystem.FileSystemUploadType.MULTIPART,
-      fieldName: 'audio_file',
-      mimeType: mimeTypeForUri(fileUri),
-      parameters: {
-        track_id: String(track.id),
-        title: track.title || '',
-        artist: track.artist || '',
-      },
-      sessionType: FileSystem.FileSystemSessionType.FOREGROUND,
-    },
-    ({ totalBytesExpectedToSend, totalBytesSent }) => {
-      if (totalBytesExpectedToSend > 0) {
-        onUploadProgress?.(Math.min(1, totalBytesSent / totalBytesExpectedToSend));
-      }
-    }
-  );
-
-  const response = await task.uploadAsync();
-  if (!response || response.status < 200 || response.status >= 300) {
-    return { success: false, reason: `HTTP_${response?.status || 0}` };
-  }
+  let prepared: { uri: string; temporary: boolean } | null = null;
   try {
+    prepared = await prepareTrackForAnalysis(track);
+    const task = FileSystem.createUploadTask(
+      `${resolvedBackendUrl}/api/analyze/`,
+      prepared.uri,
+      {
+        httpMethod: 'POST',
+        uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+        fieldName: 'audio_file',
+        mimeType: mimeTypeForUri(prepared.uri),
+        parameters: {
+          track_id: String(track.id),
+          title: track.title || '',
+          artist: track.artist || '',
+        },
+        sessionType: FileSystem.FileSystemSessionType.FOREGROUND,
+      },
+      ({ totalBytesExpectedToSend, totalBytesSent }) => {
+        if (totalBytesExpectedToSend > 0) {
+          onUploadProgress?.(Math.min(1, totalBytesSent / totalBytesExpectedToSend));
+        }
+      }
+    );
+    const response = await task.uploadAsync();
+    if (!response || response.status < 200 || response.status >= 300) {
+      return { success: false, reason: `HTTP_${response?.status || 0}` };
+    }
     const data = JSON.parse(response.body || '{}');
     return data?.success
       ? { success: true, data }
       : { success: false, data, reason: data?.reason || 'ANALISIS_SIN_RESULTADO' };
-  } catch {
-    return { success: false, reason: 'RESPUESTA_INVALIDA' };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { success: false, reason: message === 'ARCHIVO_SUPERA_LIMITE_DSP' ? message : 'RUTA_LOCAL_NO_ACCESIBLE' };
+  } finally {
+    if (prepared?.temporary) {
+      await FileSystem.deleteAsync(prepared.uri, { idempotent: true }).catch(() => {});
+    }
   }
 }
 
 /** Fetches only cached metadata. It never uploads audio in the background. */
 export const startBackgroundSync = async (options: SyncOptions = {}): Promise<SyncResult> => {
   const batchSize = options.batchSize ?? 15;
-  const backendUrl = (options.backendUrl ?? CONFIGURED_BACKEND_URL).replace(/\/$/, '');
+  const backendUrl = await getBackendUrl(options.backendUrl);
   const result: SyncResult = { success: false, syncedCount: 0, failedCount: 0, errors: [] };
 
   if (!backendUrl) {
@@ -296,14 +444,15 @@ export const startBackgroundSync = async (options: SyncOptions = {}): Promise<Sy
 /** Synchronizes one active track and uploads it only when DSP is not cached. */
 export const syncSingleTrack = async (
   track: Track,
-  backendUrl: string = CONFIGURED_BACKEND_URL
+  backendUrl?: string
 ): Promise<boolean> => {
-  if (!track?.id || !backendUrl) return false;
-  const networkCheck = await checkCanSync(true);
+  const resolvedBackendUrl = await getBackendUrl(backendUrl);
+  if (!track?.id || !resolvedBackendUrl) return false;
+  const networkCheck = await checkCanSync(false);
   if (!networkCheck.canSync) return false;
 
   try {
-    const cleanUrl = backendUrl.replace(/\/$/, '');
+    const cleanUrl = resolvedBackendUrl;
     const payload = [{
       track_id: track.id,
       id: track.id,
@@ -353,7 +502,7 @@ export const analyzeLibraryAudio = async (
   tracks: Track[],
   options: AnalyzeLibraryOptions = {}
 ): Promise<SyncResult> => {
-  const backendUrl = (options.backendUrl ?? CONFIGURED_BACKEND_URL).replace(/\/$/, '');
+  const backendUrl = await getBackendUrl(options.backendUrl);
   const result: SyncResult = { success: false, syncedCount: 0, failedCount: 0, errors: [] };
   if (!backendUrl) return { ...result, reason: 'BACKEND_NO_CONFIGURADO' };
 

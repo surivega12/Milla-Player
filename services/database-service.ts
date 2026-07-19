@@ -70,6 +70,7 @@ export interface AutoMixSettings {
   harmonic_mode: 'strict' | 'energy' | 'free';
   crossfade_seconds: number;
   cross_out_enabled: boolean;
+  volume_normalization?: boolean;
   equalizer_preset?: string;
 }
 
@@ -95,12 +96,15 @@ let webMockAutoMix: AutoMixSettings = {
   harmonic_mode: 'free',
   crossfade_seconds: 6,
   cross_out_enabled: true,
+  volume_normalization: false,
   equalizer_preset: 'flat',
 };
 
 const mapTrackRow = (row: any): Track => ({
   id: row.id,
   url: row.url,
+  source_uri: row.source_uri,
+  file_extension: row.file_extension,
   title: row.title,
   artist: row.artist,
   album: row.album,
@@ -137,13 +141,16 @@ const mapTrackRow = (row: any): Track => ({
 });
 
 const TRACK_LIST_COLUMNS = `
-  id, url, title, artist, album, duration, artwork, artwork_thumb,
+  id, url, source_uri, file_extension, title, artist, album, duration, artwork, artwork_thumb,
   bpm, key, camelot_key, replayGainTrack, replayGainAlbum, qualityBadge,
   needs_repair, needs_sync, lyrics_source, genre, play_count, last_played,
   vocal_silence_start_ms, vocal_silence_end_ms, intro_duration_ms,
   outro_duration_ms, outro_start_ms, intro_energy, outro_energy,
   beat_interval_ms, analysis_version, analysis_status
 `;
+
+// Sync needs lyric state but not every historical column returned by SELECT *.
+const TRACK_SYNC_COLUMNS = `${TRACK_LIST_COLUMNS}, lyrics_json, lyrics_lrc, lyrics_ttml, lyrics_plain`;
 
 const getWebMockDatabase = (): any => ({
   execAsync: async () => {},
@@ -188,6 +195,8 @@ export const initDatabase = async (): Promise<any> => {
         CREATE TABLE IF NOT EXISTS tracks (
           id TEXT PRIMARY KEY,
           url TEXT NOT NULL,
+          source_uri TEXT,
+          file_extension TEXT,
           title TEXT NOT NULL,
           artist TEXT NOT NULL,
           album TEXT,
@@ -231,6 +240,7 @@ export const initDatabase = async (): Promise<any> => {
           harmonic_mode TEXT DEFAULT 'free',
           crossfade_seconds INTEGER DEFAULT 6,
           cross_out_enabled INTEGER DEFAULT 1,
+          volume_normalization INTEGER DEFAULT 0,
           equalizer_preset TEXT DEFAULT 'flat'
         );
       `);
@@ -292,6 +302,8 @@ export const initDatabase = async (): Promise<any> => {
         'ALTER TABLE tracks ADD COLUMN lyrics_ttml TEXT;',
         'ALTER TABLE tracks ADD COLUMN lyrics_plain TEXT;',
         'ALTER TABLE tracks ADD COLUMN lyrics_source TEXT;',
+        'ALTER TABLE tracks ADD COLUMN source_uri TEXT;',
+        'ALTER TABLE tracks ADD COLUMN file_extension TEXT;',
         'ALTER TABLE tracks ADD COLUMN vocal_silence_start_ms REAL;',
         'ALTER TABLE tracks ADD COLUMN vocal_silence_end_ms REAL;',
         'ALTER TABLE tracks ADD COLUMN intro_duration_ms REAL;',
@@ -316,12 +328,16 @@ export const initDatabase = async (): Promise<any> => {
       try {
         await database.execAsync('ALTER TABLE automix_settings ADD COLUMN equalizer_preset TEXT DEFAULT \'flat\';');
       } catch (e) {}
+      try {
+        await database.execAsync('ALTER TABLE automix_settings ADD COLUMN volume_normalization INTEGER DEFAULT 0;');
+      } catch (e) {}
 
       await database.execAsync(`
         CREATE INDEX IF NOT EXISTS idx_tracks_title_nocase ON tracks(title COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_tracks_artist_nocase ON tracks(artist COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_tracks_album_nocase ON tracks(album COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_tracks_sync_state ON tracks(needs_sync, analysis_status);
+        CREATE INDEX IF NOT EXISTS idx_tracks_source_uri ON tracks(source_uri);
         CREATE INDEX IF NOT EXISTS idx_playlist_tracks_position ON playlist_tracks(playlist_id, position);
       `);
 
@@ -501,7 +517,7 @@ export const getTracksNeedingSync = async (limit: number = 50): Promise<Track[]>
   try {
     const database = await initDatabase();
     const result: any[] = await database.getAllAsync(
-      `SELECT * FROM tracks 
+      `SELECT ${TRACK_SYNC_COLUMNS} FROM tracks
        WHERE needs_sync = 1
           OR ((lyrics_lrc IS NULL AND lyrics_json IS NULL AND lyrics_ttml IS NULL AND lyrics_plain IS NULL)
               AND COALESCE(lyrics_source, '') <> 'not_found')
@@ -529,13 +545,13 @@ export const insertTracks = async (tracks: Track[]) => {
 
   const statement = await database.prepareAsync(`
     INSERT INTO tracks (
-      id, url, title, artist, album, duration, artwork, artwork_thumb, 
+      id, url, source_uri, file_extension, title, artist, album, duration, artwork, artwork_thumb,
       bpm, key, camelot_key, replayGainTrack, replayGainAlbum, qualityBadge, needs_repair, needs_sync,
       lyrics_json, lyrics_lrc, lyrics_ttml, lyrics_plain, lyrics_source, genre, play_count, last_played,
       vocal_silence_start_ms, vocal_silence_end_ms, intro_duration_ms, outro_duration_ms, outro_start_ms,
       intro_energy, outro_energy, beat_interval_ms, analysis_version, analysis_status
     ) VALUES (
-      $id, $url, $title, $artist, $album, $duration, $artwork, $artwork_thumb,
+      $id, $url, $source_uri, $file_extension, $title, $artist, $album, $duration, $artwork, $artwork_thumb,
       $bpm, $key, $camelot_key, $replayGainTrack, $replayGainAlbum, $qualityBadge, $needs_repair, $needs_sync,
       $lyrics_json, $lyrics_lrc, $lyrics_ttml, $lyrics_plain, $lyrics_source, $genre, $play_count, $last_played,
       $vocal_silence_start_ms, $vocal_silence_end_ms, $intro_duration_ms, $outro_duration_ms, $outro_start_ms,
@@ -543,6 +559,8 @@ export const insertTracks = async (tracks: Track[]) => {
     )
     ON CONFLICT(id) DO UPDATE SET
       url = excluded.url,
+      source_uri = COALESCE(excluded.source_uri, tracks.source_uri),
+      file_extension = COALESCE(excluded.file_extension, tracks.file_extension),
       title = excluded.title,
       artist = excluded.artist,
       album = excluded.album,
@@ -583,6 +601,8 @@ export const insertTracks = async (tracks: Track[]) => {
       await statement.executeAsync({
         $id: t.id ?? null,
         $url: t.url ?? t.id ?? null,
+        $source_uri: (t as any).source_uri ?? null,
+        $file_extension: (t as any).file_extension ?? null,
         $title: t.title ?? 'Desconocido',
         $artist: t.artist ?? 'Unknown',
         $album: t.album ?? null,
@@ -669,6 +689,31 @@ export const updateTrackUri = async (oldId: string, newUri: string): Promise<boo
   }
 };
 
+/**
+ * Stores a file:// copy used by native playback while retaining the original
+ * MediaStore/SAF URI. Cache files may disappear, so source_uri is never lost.
+ */
+export const updateTrackPlaybackUri = async (
+  trackId: string,
+  playbackUri: string,
+  sourceUri?: string
+): Promise<boolean> => {
+  if (!trackId || !playbackUri || Platform.OS === 'web') return false;
+  try {
+    const database = await initDatabase();
+    await database.runAsync(
+      `UPDATE tracks
+       SET url = ?, source_uri = COALESCE(source_uri, ?)
+       WHERE id = ?;`,
+      [playbackUri, sourceUri || null, trackId]
+    );
+    return true;
+  } catch (error) {
+    console.warn(`[DatabaseService] No se pudo guardar la ruta reproducible de ${trackId}:`, error);
+    return false;
+  }
+};
+
 export const initializeVertexDatabase = initDatabase;
 
 export const getAutoMixSettings = async (): Promise<AutoMixSettings> => {
@@ -677,16 +722,19 @@ export const getAutoMixSettings = async (): Promise<AutoMixSettings> => {
   try {
     const database = await initDatabase();
     await database.runAsync(
-      `INSERT OR IGNORE INTO automix_settings (id, enabled, bpm_tolerance, harmonic_mode, crossfade_seconds, cross_out_enabled, equalizer_preset) VALUES (1, 0, 5, 'free', 6, 1, 'flat');`
+      `INSERT OR IGNORE INTO automix_settings (id, enabled, bpm_tolerance, harmonic_mode, crossfade_seconds, cross_out_enabled, volume_normalization, equalizer_preset) VALUES (1, 0, 5, 'free', 6, 1, 0, 'flat');`
     );
-    const row: any = await database.getFirstAsync('SELECT enabled, bpm_tolerance, harmonic_mode, crossfade_seconds, cross_out_enabled, equalizer_preset FROM automix_settings WHERE id = 1;');
+    const row: any = await database.getFirstAsync('SELECT enabled, bpm_tolerance, harmonic_mode, crossfade_seconds, cross_out_enabled, volume_normalization, equalizer_preset FROM automix_settings WHERE id = 1;');
     if (row) {
       return {
         enabled: row.enabled !== undefined && row.enabled !== null ? Boolean(row.enabled) : false,
         bpm_tolerance: row.bpm_tolerance !== undefined && row.bpm_tolerance !== null ? Number(row.bpm_tolerance) : 5,
         harmonic_mode: (row.harmonic_mode as any) || 'free',
-        crossfade_seconds: Number(row.crossfade_seconds) > 0 ? Number(row.crossfade_seconds) : (Boolean(row.enabled) ? 6 : 0),
+        crossfade_seconds: Number.isFinite(Number(row.crossfade_seconds))
+          ? Math.max(0, Number(row.crossfade_seconds))
+          : 6,
         cross_out_enabled: row.cross_out_enabled !== undefined && row.cross_out_enabled !== null ? Boolean(row.cross_out_enabled) : false,
+        volume_normalization: row.volume_normalization !== undefined && row.volume_normalization !== null ? Boolean(row.volume_normalization) : false,
         equalizer_preset: row.equalizer_preset || 'flat',
       };
     }
@@ -699,6 +747,7 @@ export const getAutoMixSettings = async (): Promise<AutoMixSettings> => {
     harmonic_mode: 'free',
     crossfade_seconds: 6,
     cross_out_enabled: true,
+    volume_normalization: false,
     equalizer_preset: 'flat',
   };
 };
@@ -713,21 +762,62 @@ export const saveAutoMixSettings = async (settings: Partial<AutoMixSettings>): P
     const database = await initDatabase();
     const current = await getAutoMixSettings();
     const updated = { ...current, ...settings };
-    if (updated.enabled && updated.crossfade_seconds <= 0) updated.crossfade_seconds = 6;
+    const requestedTransition = Number(updated.crossfade_seconds);
+    updated.crossfade_seconds = Number.isFinite(requestedTransition)
+      ? Math.min(12, Math.max(0, requestedTransition))
+      : 6;
     await database.runAsync(
-      `INSERT OR REPLACE INTO automix_settings (id, enabled, bpm_tolerance, harmonic_mode, crossfade_seconds, cross_out_enabled, equalizer_preset) VALUES (1, ?, ?, ?, ?, ?, ?);`,
+      `INSERT OR REPLACE INTO automix_settings (id, enabled, bpm_tolerance, harmonic_mode, crossfade_seconds, cross_out_enabled, volume_normalization, equalizer_preset) VALUES (1, ?, ?, ?, ?, ?, ?, ?);`,
       [
         updated.enabled ? 1 : 0,
         updated.bpm_tolerance,
         updated.harmonic_mode,
         updated.crossfade_seconds,
         updated.cross_out_enabled ? 1 : 0,
+        updated.volume_normalization ? 1 : 0,
         updated.equalizer_preset || 'flat',
       ]
     );
     return true;
   } catch (error) {
     console.error('[DatabaseService] Error en saveAutoMixSettings:', error);
+    return false;
+  }
+};
+
+export const getAppSetting = async (key: string): Promise<string | null> => {
+  if (!key) return null;
+  if (Platform.OS === 'web') {
+    if (key === 'currentTheme') return webMockTheme;
+    return null;
+  }
+
+  try {
+    const database = await initDatabase();
+    const row: any = await database.getFirstAsync('SELECT value FROM app_settings WHERE key = ?;', [key]);
+    return typeof row?.value === 'string' ? row.value : null;
+  } catch (error) {
+    console.warn(`[DatabaseService] No se pudo leer el ajuste ${key}:`, error);
+    return null;
+  }
+};
+
+export const saveAppSetting = async (key: string, value: string): Promise<boolean> => {
+  if (!key) return false;
+  if (Platform.OS === 'web') {
+    if (key === 'currentTheme') webMockTheme = value;
+    return true;
+  }
+
+  try {
+    const database = await initDatabase();
+    await database.runAsync(
+      'INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?);',
+      [key, value]
+    );
+    return true;
+  } catch (error) {
+    console.warn(`[DatabaseService] No se pudo guardar el ajuste ${key}:`, error);
     return false;
   }
 };
@@ -1368,13 +1458,14 @@ export const restoreLocalBackup = async (fileUriOrContent?: string): Promise<boo
     if (parsed.data.automix_settings) {
       const am = parsed.data.automix_settings;
       await database.runAsync(
-        `INSERT OR REPLACE INTO automix_settings (id, enabled, bpm_tolerance, harmonic_mode, crossfade_seconds, cross_out_enabled, equalizer_preset) VALUES (1, ?, ?, ?, ?, ?, ?);`,
+        `INSERT OR REPLACE INTO automix_settings (id, enabled, bpm_tolerance, harmonic_mode, crossfade_seconds, cross_out_enabled, volume_normalization, equalizer_preset) VALUES (1, ?, ?, ?, ?, ?, ?, ?);`,
         [
           am.enabled ? 1 : 0,
           am.bpm_tolerance || 5,
           am.harmonic_mode || 'free',
           am.crossfade_seconds || 0,
           am.cross_out_enabled ? 1 : 0,
+          am.volume_normalization ? 1 : 0,
           am.equalizer_preset || 'flat'
         ]
       );
