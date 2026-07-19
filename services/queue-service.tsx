@@ -237,7 +237,18 @@ export class VertexQueueManager {
       referenceTrack.id
     ]);
 
-    const allCandidates = this.fullCatalog.filter(t => !excludedIds.has(t.id));
+    let allCandidates = this.fullCatalog.filter(t => !excludedIds.has(t.id));
+    // In a small playlist, excluding the recent history can remove the whole
+    // catalog. Reuse the least-recent candidates instead of ending playback.
+    if (allCandidates.length === 0) {
+      allCandidates = this.fullCatalog.filter(t =>
+        t.id !== referenceTrack.id && !this.priorityQueue.some((queued) => queued.id === t.id)
+      );
+    }
+    if (allCandidates.length === 0) {
+      this.autoMixQueue = [];
+      return;
+    }
     const analyzedCandidates = allCandidates.filter((track) =>
       track.analysis_status === 'ready' && Boolean(track.bpm) && Boolean(track.camelot_key || track.key)
     );

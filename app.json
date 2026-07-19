@@ -6,6 +6,7 @@
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
+    "newArchEnabled": false,
     "ios": {
       "supportsTablet": true
     },
@@ -20,8 +21,6 @@
       "package": "com.millay.Milla",
       "permissions": [
         "READ_MEDIA_AUDIO",
-        "FOREGROUND_SERVICE",
-        "FOREGROUND_SERVICE_MEDIA_PLAYBACK",
         "WAKE_LOCK"
       ],
       "blockedPermissions": [
@@ -39,8 +38,6 @@
       [
         "expo-media-library",
         {
-          "photosPermission": "Permite a Milla acceder a tu biblioteca de musica y caratulas para el procesamiento Hi-Res y AutoMix offline.",
-          "savePhotosPermission": "Permite a Milla guardar caratulas procesadas y optimizadas en tu almacenamiento local.",
           "granularPermissions": [
             "audio"
           ]

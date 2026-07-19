@@ -39,6 +39,14 @@ Milla es un reproductor local para Android construido con Expo 57, React Native 
 - Las acciones aun no implementadas del menu de pista se retiraron de la interfaz. Compartir y Detalles son funcionales.
 - El boton Atrás de Android ahora cierra modales, vuelve desde subpantallas de Inicio y recorre el historial de pestañas sin terminar la app.
 
+### Correcciones de estabilidad posteriores
+
+- El permiso de audio ya no se solicita dentro del arranque. SQLite y la primera pantalla se estabilizan
+  primero; el dialogo de Android solo se abre desde `Conceder Acceso`, con una unica solicitud en vuelo
+  y un fallback seguro si el modulo nativo rechaza la consulta.
+- `newArchEnabled` queda desactivado de forma explicita en Expo y Gradle mientras Milla utiliza modulos
+  comunitarios que no aportan una ventaja necesaria con la Nueva Arquitectura.
+
 ## Biblioteca y caratulas
 
 - La pantalla muestra inmediatamente las pistas recibidas desde `App.tsx`; SQLite solo se consulta al montar si no hay catalogo en memoria.
@@ -66,6 +74,9 @@ Milla es un reproductor local para Android construido con Expo 57, React Native 
 - Los modos estricto, energia y libre modifican realmente la puntuacion armonica.
 - Se elimino la exclusion mutua que apagaba Auto Mix al configurar crossfade o cross-out.
 - El final se desvanece y la pista siguiente recupera gradualmente ReplayGain.
+- El pool de AutoMix ya no puede quedar vacio por excluir las ultimas pistas escuchadas: en catalogos
+  pequenos usa un fallback de las menos recientes. El controlador de fades serializa los eventos
+  de progreso para impedir dos transiciones simultaneas y una cola bloqueada.
 
 El motor actual usa un solo decodificador. Por ello ofrece seleccion armonica y fade secuencial estable, pero no superpone dos audios ni sincroniza beats en paralelo. Un crossfade DJ real con dos canciones simultaneas requiere un modulo nativo de doble deck y analisis fiable de beat-grid, no solo BPM.
 

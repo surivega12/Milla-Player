@@ -1,4 +1,5 @@
 import * as MediaLibrary from 'expo-media-library/legacy';
+import * as MediaLibraryPermissions from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy';
 import { Platform } from 'react-native';
 import { Track } from '../components/PlayerBar';
@@ -6,15 +7,44 @@ import { extractMetadata } from './metadata-service';
 import { getCachedTracks, insertTracks, updateTrackPlaybackUri, updateTrackUri, setWebMockTracks } from './database-service';
 import jsmediatags from 'jsmediatags';
 
+let libraryPermissionRequest: Promise<boolean> | null = null;
+
+function isAudioPermissionGranted(response: { status?: string }): boolean {
+  return response?.status === 'granted';
+}
+
+export async function getLibraryPermissionStatus(): Promise<boolean> {
+  if (Platform.OS === 'web') return true;
+  try {
+    const response = await MediaLibraryPermissions.getPermissionsAsync(false, ['audio']);
+    return isAudioPermissionGranted(response);
+  } catch (error) {
+    console.warn('[LibraryService] No se pudo consultar el permiso de audio:', error);
+    return false;
+  }
+}
+
 export async function requestLibraryPermission(): Promise<boolean> {
   if (Platform.OS === 'web') return true;
-  const { status, canAskAgain } = await MediaLibrary.getPermissionsAsync(false, ['audio']);
-  if (status === 'granted') return true;
-  if (status === 'undetermined' || canAskAgain) {
-    const { status: newStatus } = await MediaLibrary.requestPermissionsAsync(false, ['audio']);
-    return newStatus === 'granted';
-  }
-  return false;
+  if (libraryPermissionRequest) return libraryPermissionRequest;
+
+  libraryPermissionRequest = (async () => {
+    try {
+      const current = await MediaLibraryPermissions.getPermissionsAsync(false, ['audio']);
+      if (isAudioPermissionGranted(current)) return true;
+      if (current.status !== 'undetermined' && current.canAskAgain === false) return false;
+
+      const requested = await MediaLibraryPermissions.requestPermissionsAsync(false, ['audio']);
+      return isAudioPermissionGranted(requested);
+    } catch (error) {
+      console.warn('[LibraryService] No se pudo solicitar el permiso de audio:', error);
+      return false;
+    } finally {
+      libraryPermissionRequest = null;
+    }
+  })();
+
+  return libraryPermissionRequest;
 }
 
 const AUDIO_EXTENSIONS = ['mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg', 'opus', 'dsd', 'dff', 'dsf'] as const;

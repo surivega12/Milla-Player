@@ -8,6 +8,7 @@ let fadingOutTrackId: string | null = null;
 let shouldFadeInNextTrack = false;
 let fadeRestoreVolume = 1;
 let fadeGeneration = 0;
+let fadeRequestInFlight = false;
 
 async function toNativeTrackPayload(track: VertexTrack) {
   const url = await ensureTrackPlayableUri(track);
@@ -252,53 +253,59 @@ export async function playbackService() {
       fadingOutTrackId = null;
       shouldFadeInNextTrack = false;
     }
-    const activeTrack = await TrackPlayer.getActiveTrack().catch(() => undefined);
-    const analyzedOutroSeconds = Number((activeTrack as any)?.outro_duration_ms || 0) / 1000;
-    const analyzedOutroStartSeconds = Number((activeTrack as any)?.outro_start_ms || 0) / 1000;
-    const fadeWindowSeconds = globalVertexQueueManager.isCrossOutEnabled() && analyzedOutroSeconds > 0
-      ? Math.min(transitionSeconds, Math.max(1, analyzedOutroSeconds))
-      : transitionSeconds;
-    const naturalFadeStart = Math.max(0, event.duration - fadeWindowSeconds);
-    const isUsefulEarlyOutro = analyzedOutroStartSeconds > 4 &&
-      analyzedOutroStartSeconds < naturalFadeStart &&
-      event.duration - analyzedOutroStartSeconds <= 45;
-    const fadeStart = isUsefulEarlyOutro ? analyzedOutroStartSeconds : naturalFadeStart;
-    if (remaining <= 0 || event.position < fadeStart) return;
+    if (fadeRequestInFlight) return;
+    fadeRequestInFlight = true;
+    try {
+      const activeTrack = await TrackPlayer.getActiveTrack().catch(() => undefined);
+      const analyzedOutroSeconds = Number((activeTrack as any)?.outro_duration_ms || 0) / 1000;
+      const analyzedOutroStartSeconds = Number((activeTrack as any)?.outro_start_ms || 0) / 1000;
+      const fadeWindowSeconds = globalVertexQueueManager.isCrossOutEnabled() && analyzedOutroSeconds > 0
+        ? Math.min(transitionSeconds, Math.max(1, analyzedOutroSeconds))
+        : transitionSeconds;
+      const naturalFadeStart = Math.max(0, event.duration - fadeWindowSeconds);
+      const isUsefulEarlyOutro = analyzedOutroStartSeconds > 4 &&
+        analyzedOutroStartSeconds < naturalFadeStart &&
+        event.duration - analyzedOutroStartSeconds <= 45;
+      const fadeStart = isUsefulEarlyOutro ? analyzedOutroStartSeconds : naturalFadeStart;
+      if (remaining <= 0 || event.position < fadeStart) return;
 
-    const activeId = activeTrack?.id ? String(activeTrack.id) : null;
-    if (!activeId || fadingOutTrackId === activeId) return;
+      const activeId = activeTrack?.id ? String(activeTrack.id) : null;
+      if (!activeId || fadingOutTrackId === activeId) return;
 
-    fadingOutTrackId = activeId;
-    shouldFadeInNextTrack = true;
-    const currentFadeGeneration = ++fadeGeneration;
-    const startVolume = await TrackPlayer.getVolume().catch(() => 1);
-    fadeRestoreVolume = startVolume;
-    const fadeDurationMs = Math.max(350, Math.min(remaining, fadeWindowSeconds) * 1000);
-    const steps = Math.max(8, Math.min(40, Math.round(fadeDurationMs / 100)));
-    for (let step = steps - 1; step >= 0; step--) {
-      if (fadeGeneration !== currentFadeGeneration || fadingOutTrackId !== activeId) return;
-      await TrackPlayer.setVolume(Math.max(0.02, startVolume * (step / steps))).catch(() => {});
-      await new Promise<void>((resolve) => setTimeout(resolve, fadeDurationMs / steps));
-    }
-
-    // This TrackPlayer setup owns one active decoder. For a DSP-confirmed long
-    // outro, advance after the fade instead of leaving a silent tail.
-    if (isUsefulEarlyOutro && fadeGeneration === currentFadeGeneration && fadingOutTrackId === activeId) {
-      try {
-        const [queue, activeIndex] = await Promise.all([
-          TrackPlayer.getQueue(),
-          TrackPlayer.getActiveTrackIndex(),
-        ]);
-        if (activeIndex !== undefined && activeIndex !== null && queue[activeIndex + 1]) {
-          await TrackPlayer.skipToNext();
-          await TrackPlayer.play();
-        }
-      } catch (error) {
-        shouldFadeInNextTrack = false;
-        fadingOutTrackId = null;
-        await TrackPlayer.setVolume(fadeRestoreVolume).catch(() => {});
-        console.warn('[PlaybackService] No se pudo avanzar tras el cross-out:', error);
+      fadingOutTrackId = activeId;
+      shouldFadeInNextTrack = true;
+      const currentFadeGeneration = ++fadeGeneration;
+      const startVolume = await TrackPlayer.getVolume().catch(() => 1);
+      fadeRestoreVolume = startVolume;
+      const fadeDurationMs = Math.max(350, Math.min(remaining, fadeWindowSeconds) * 1000);
+      const steps = Math.max(8, Math.min(40, Math.round(fadeDurationMs / 100)));
+      for (let step = steps - 1; step >= 0; step--) {
+        if (fadeGeneration !== currentFadeGeneration || fadingOutTrackId !== activeId) return;
+        await TrackPlayer.setVolume(Math.max(0.02, startVolume * (step / steps))).catch(() => {});
+        await new Promise<void>((resolve) => setTimeout(resolve, fadeDurationMs / steps));
       }
+
+      // This engine owns one active decoder. For a DSP-confirmed long outro,
+      // advance after the fade instead of leaving a silent tail.
+      if (isUsefulEarlyOutro && fadeGeneration === currentFadeGeneration && fadingOutTrackId === activeId) {
+        try {
+          const [queue, activeIndex] = await Promise.all([
+            TrackPlayer.getQueue(),
+            TrackPlayer.getActiveTrackIndex(),
+          ]);
+          if (activeIndex !== undefined && activeIndex !== null && queue[activeIndex + 1]) {
+            await TrackPlayer.skipToNext();
+            await TrackPlayer.play();
+          }
+        } catch (error) {
+          shouldFadeInNextTrack = false;
+          fadingOutTrackId = null;
+          await TrackPlayer.setVolume(fadeRestoreVolume).catch(() => {});
+          console.warn('[PlaybackService] No se pudo avanzar tras el cross-out:', error);
+        }
+      }
+    } finally {
+      fadeRequestInFlight = false;
     }
   });
 

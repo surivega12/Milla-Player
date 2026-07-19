@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import { StatusBar } from 'expo-status-bar';
 import { View, StyleSheet, Alert, ActivityIndicator, TouchableOpacity, Text, Platform, BackHandler } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
-import * as MediaLibrary from 'expo-media-library/legacy';
 import './global.css';
 import { getVibrantColorFromImage } from './utils/vibrant';
 import { GlassBackground } from './components/GlassBackground';
@@ -28,7 +27,7 @@ import TrackPlayer, {
   State,
 } from './services/player-engine';
 import { configureAutoMixQueue, playPlaylist } from './services/audio-service';
-import { ensureTrackPlayableUri, hydrateTrackMetadataForPlayback, isTrackPlayerCompatibleUri, scanDeviceAudioFiles, scanManualMusicFolder } from './services/library-service';
+import { ensureTrackPlayableUri, getLibraryPermissionStatus, hydrateTrackMetadataForPlayback, isTrackPlayerCompatibleUri, requestLibraryPermission, scanDeviceAudioFiles, scanManualMusicFolder } from './services/library-service';
 import { getAutoMixSettings, getCachedTracks, initializeVertexDatabase, insertTracks, isTrackFavorite, saveAutoMixSettings, toggleTrackFavorite } from './services/database-service';
 import { searchRecording } from './services/musicbrainz-service';
 import { VertexQueueProvider, useVertexQueue, VertexTrack } from './services/queue-service';
@@ -64,6 +63,7 @@ function MainAppContent() {
   // Estados de control de arranque y permisos (PASO 1)
   const [isDbReady, setIsDbReady] = useState<boolean>(false);
   const [hasPermissions, setHasPermissions] = useState<boolean | null>(null);
+  const [isRequestingPermission, setIsRequestingPermission] = useState(false);
 
   // Catálogo de música dinámico (100% real, sin datos de demostración)
   const [tracksList, setTracksList] = useState<Track[]>([]);
@@ -107,18 +107,6 @@ function MainAppContent() {
 
     async function init() {
       try {
-        if (Platform.OS === 'web') {
-          setHasPermissions(true);
-        } else {
-          const { status, canAskAgain } = await MediaLibrary.getPermissionsAsync(false, ['audio']);
-          let granted = status === 'granted';
-          if (!granted && (status === 'undetermined' || canAskAgain)) {
-            const { status: newStatus } = await MediaLibrary.requestPermissionsAsync(false, ['audio']);
-            granted = newStatus === 'granted';
-          }
-          setHasPermissions(granted);
-        }
-
         await initializeVertexDatabase();
         const cachedTracks = await getCachedTracks();
         setTracksList(cachedTracks);
@@ -131,6 +119,8 @@ function MainAppContent() {
         // prevents an Android media-session failure from taking down the
         // library immediately after the permission dialog.
         setIsDbReady(true);
+        // Android only opens the system dialog from the explicit button below.
+        setHasPermissions(await getLibraryPermissionStatus());
         setTimeout(() => syncDownloads(cachedTracks).catch(() => {}), 0);
 
         // 🚀 Punto 3.1: Encendido automático y silencioso del Worker en segundo plano tras 5 segundos
@@ -143,6 +133,7 @@ function MainAppContent() {
       } catch (err) {
         console.error('Error al inicializar la arquitectura de Milla:', err);
         setIsDbReady(true);
+        setHasPermissions(false);
       }
     }
     init();
@@ -645,22 +636,24 @@ function MainAppContent() {
           </Text>
           <TouchableOpacity
             onPress={async () => {
+              if (isRequestingPermission) return;
+              setIsRequestingPermission(true);
               try {
-                const { status } = await MediaLibrary.requestPermissionsAsync(false, ['audio']);
-              if (status === 'granted') {
-                setHasPermissions(true);
-              } else {
+                const granted = await requestLibraryPermission();
+                if (granted) {
+                  setHasPermissions(true);
+                } else {
                 Alert.alert('Permiso denegado', 'Por favor, otorga el permiso de archivos para que Milla pueda escanear tu música local.');
-              }
-              } catch (error) {
-                console.warn('[App] No se pudo solicitar el permiso de audio:', error);
-                Alert.alert('Permiso de audio', 'No se pudo abrir el dialogo de permisos. Revisa los ajustes de Android.');
+                }
+              } finally {
+                setIsRequestingPermission(false);
               }
             }}
+            disabled={isRequestingPermission}
             className="bg-blue-600 w-full py-4 rounded-2xl items-center shadow-lg"
           >
             <Text className="text-white font-bold text-base tracking-wide">
-              Conceder Acceso
+              {isRequestingPermission ? 'Abriendo permisos...' : 'Conceder Acceso'}
             </Text>
           </TouchableOpacity>
         </View>
